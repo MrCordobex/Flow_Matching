@@ -1,0 +1,59 @@
+seed: 42
+
+data:
+  dataset_dir: ../Datos/processed_image2/processed_image2
+  subset: solid
+  min_mf_mean: null
+  val_ratio: 0.20
+  batch_size: 16
+  num_workers: 0
+  pin_memory: true
+  include_fz_channel: false
+
+model:
+  sample_size: 64
+  in_channels: 1
+  out_channels: 1
+  layers_per_block: 2
+  block_out_channels: [128, 128, 256, 256, 512, 512]
+  down_block_types:
+    - DownBlock2D
+    - DownBlock2D
+    - DownBlock2D
+    - AttnDownBlock2D
+    - AttnDownBlock2D
+    - AttnDownBlock2D
+  up_block_types:
+    - AttnUpBlock2D
+    - AttnUpBlock2D
+    - AttnUpBlock2D
+    - UpBlock2D
+    - UpBlock2D
+    - UpBlock2D
+  method: linear_flow_matching
+
+training:
+  epochs: 75
+  learning_rate: 2.0e-5
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+  lr_patience: 8
+  lr_factor: 0.5
+  early_stopping_patience: 15
+  mixed_precision: false
+  sample_every_n_epochs: 10
+  sample_batch_size: 6
+  sample_inference_steps: 50
+  sample_solver: euler
+
+mlflow:
+  tracking_uri: ./mlruns
+  experiment_name: architect_flow_solid
+  run_name_prefix: architect
+  tags:
+    model_role: architect
+    stage: thesis
+
+runtime:
+  device: auto
+  project_name: tfm_shells

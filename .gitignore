@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.tmp_tests/
+
+# Sensitive data and local datasets
+/data/
+/data/**
+*.npz
+*.npy
+*.csv
+*.parquet
+*.h5
+*.hdf5
+*.pkl
+*.joblib
+
+# Training outputs
+artifacts/
+/models/
+mlruns/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+
+# Secrets / environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.secrets
+
+# Always keep source code under src/
+!/src/
+!/src/**/
+!/src/**/*.py
+
+
+#Comparaciones entre modelos
+comparation/

@@ -1,0 +1,63 @@
+seed: 42
+
+data:
+  dataset_dir: ../Datos/processed_image2/processed_image2
+  subset: solid
+  min_mf_mean: null
+  val_ratio: 0.20
+  batch_size: 8
+  num_workers: 0
+  pin_memory: true
+  include_fz_channel: true
+
+model:
+  kind: parallel_pb_unet
+  sample_size: 64
+  in_channels: 2
+  out_channels: 13
+  branch_channels:
+    u: 1
+    m: 6
+    f: 6
+  layers_per_block: 2
+  block_out_channels: [128, 128, 256, 256, 512, 512]
+  down_block_types:
+    - DownBlock2D
+    - DownBlock2D
+    - DownBlock2D
+    - AttnDownBlock2D
+    - AttnDownBlock2D
+    - AttnDownBlock2D
+  up_block_types:
+    - AttnUpBlock2D
+    - AttnUpBlock2D
+    - AttnUpBlock2D
+    - UpBlock2D
+    - UpBlock2D
+    - UpBlock2D
+  method: linear_flow_matching
+
+training:
+  epochs: 60
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+  lr_patience: 8
+  lr_factor: 0.5
+  early_stopping_patience: 15
+  mixed_precision: false
+  lambda_max: 1.0e-3
+  warmup_epochs: 10
+  timestep_power: 2.0
+
+mlflow:
+  tracking_uri: ./mlruns
+  experiment_name: engineer_flow_pbunet_solid
+  run_name_prefix: engineer
+  tags:
+    model_role: engineer
+    stage: thesis
+
+runtime:
+  device: auto
+  project_name: tfm_shells

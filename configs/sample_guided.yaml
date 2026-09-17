@@ -1,0 +1,34 @@
+seed: 7
+
+conditioning:
+  source_file: ../Datos/processed_image2/processed_image2/shell_2600.npz
+  batch_size: 8
+
+architect:
+  checkpoint: models/architect/latest/best.pt
+
+engineer:
+  checkpoint: models/engineer/latest/best.pt
+
+sampling:
+  num_inference_steps: 50
+  solver: euler
+  guidance_scale: 1.0
+  grad_clip: 5.0
+  guidance_schedule: bell
+  guide_w_min: 0.0
+  guide_w_max: 1.0
+  guide_power: 1.5
+  bell_peak: 0.5
+  bell_width: 0.22
+
+mlflow:
+  tracking_uri: ./mlruns
+  experiment_name: flow_guided_sampling_solid
+  run_name_prefix: sample
+  tags:
+    pipeline: flow_matching_pbunet
+    stage: thesis
+
+runtime:
+  device: auto
