@@ -11,7 +11,7 @@ data:
   include_fz_channel: true
 
 model:
-  kind: parallel_pb_unet
+  kind: hybrid_fourier_unet
   sample_size: 64
   in_channels: 2
   out_channels: 13
@@ -19,22 +19,12 @@ model:
     u: 1
     m: 6
     f: 6
-  layers_per_block: 2
-  block_out_channels: [128, 128, 256, 256, 512, 512]
-  down_block_types:
-    - DownBlock2D
-    - DownBlock2D
-    - DownBlock2D
-    - AttnDownBlock2D
-    - AttnDownBlock2D
-    - AttnDownBlock2D
-  up_block_types:
-    - AttnUpBlock2D
-    - AttnUpBlock2D
-    - AttnUpBlock2D
-    - UpBlock2D
-    - UpBlock2D
-    - UpBlock2D
+  base_channels: 32
+  spectral_modes: 8
+  spectral_layers: 2
+  fft_padding: 4
+  time_embedding_dim: 128
+  dropout: 0.05
   method: vp_conditioned_surrogate
   cosine_s: 0.008
 
@@ -57,10 +47,14 @@ training:
     thickness: 0.1
     lambda_max: 0.05
     warmup_epochs: 10
+  gradient:
+    enabled: true
+    lambda_max: 0.05
+    warmup_epochs: 5
 
 mlflow:
   tracking_uri: ./mlruns
-  experiment_name: engineer_vp_pbunet_solid
+  experiment_name: engineer_vp_fourier_unet_solid
   run_name_prefix: engineer
   tags:
     model_role: engineer

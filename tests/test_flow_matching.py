@@ -14,6 +14,7 @@ from tfm_shells.training.train_architect import _run_epoch as run_architect_epoc
 from tfm_shells.training.train_engineer import _run_epoch
 from tfm_shells.vp_diffusion import CosineVPSchedule, ddim_step, sample_ddim, sample_vp_path, vp_model_time
 from tfm_shells.utils.physics import (
+    balanced_gradient_loss,
     balanced_supervised_loss,
     branchwise_supervised_losses,
     compute_constitutive_loss,
@@ -83,6 +84,61 @@ class FlowMatchingTests(unittest.TestCase):
         losses = branchwise_supervised_losses(pred, target)
         self.assertAlmostEqual(float(balanced_supervised_loss(losses)), 1.0 / 3.0)
         self.assertAlmostEqual(float((pred - target).square().mean()), 1.0 / 13.0)
+
+    def test_gradient_loss_detects_spatial_errors_in_each_branch(self) -> None:
+        target = torch.zeros(1, 13, 8, 8)
+        for channel in (0, 1, 7):
+            pred = target.clone()
+            pred[:, channel, 3:5, 3:5] = 1.0
+            self.assertGreater(float(balanced_gradient_loss(pred, target)), 0.0)
+        self.assertEqual(float(balanced_gradient_loss(target, target)), 0.0)
+
+    def test_hybrid_fourier_surrogate_predicts_13_fields_and_backpropagates(self) -> None:
+        model = build_unet({
+            "kind": "hybrid_fourier_unet", "sample_size": 16, "in_channels": 2,
+            "out_channels": 13, "base_channels": 8, "spectral_modes": 3,
+            "spectral_layers": 1, "fft_padding": 2, "time_embedding_dim": 32,
+            "branch_channels": {"u": 1, "m": 6, "f": 6},
+        })
+        inputs = torch.randn(2, 2, 16, 16, requires_grad=True)
+        prediction = model(inputs, torch.tensor([0.0, 999.0])).sample
+        self.assertEqual(tuple(prediction.shape), (2, 13, 16, 16))
+        self.assertTrue(torch.isfinite(prediction).all())
+        prediction.square().mean().backward()
+        self.assertGreater(float(inputs.grad.abs().sum()), 0.0)
+        self.assertGreater(float(model.bottleneck[0].spectral.positive.grad.abs().sum()), 0.0)
+        with torch.no_grad():
+            early = model(inputs[:1], torch.tensor([0.0])).sample
+            late = model(inputs[:1], torch.tensor([999.0])).sample
+        self.assertFalse(torch.allclose(early, late))
+
+    def test_hybrid_fourier_surrogate_trains_with_gradient_loss_on_vp_states(self) -> None:
+        model = build_unet({
+            "kind": "hybrid_fourier_unet", "sample_size": 8, "in_channels": 2,
+            "out_channels": 13, "base_channels": 8, "spectral_modes": 2,
+            "spectral_layers": 1, "fft_padding": 1, "time_embedding_dim": 32,
+        })
+        batch = {
+            "z": torch.randn(1, 1, 8, 8), "fz_norm": torch.zeros(1, 1, 8, 8),
+            "type_channel": torch.full((1, 1, 8, 8), -1.0),
+            "fz_real": torch.zeros(1, 1, 8, 8), "physics": torch.randn(1, 13, 8, 8),
+            "ds": torch.ones(1, 1, 8, 8), "dv": torch.ones(1, 1, 8, 8),
+            "mf_true": torch.zeros(1, 1, 8, 8),
+        }
+        stats = {"physics_mean": torch.zeros(13, 1, 1).tolist(),
+                 "physics_std": torch.ones(13, 1, 1).tolist()}
+        config = {"training": {"mixed_precision": False, "timestep_power": 2.0,
+                               "warmup_epochs": 0, "epochs": 2, "grad_clip_norm": 1.0,
+                               "gradient": {"enabled": True, "lambda_max": 0.05,
+                                            "warmup_epochs": 0}}}
+        result = _run_epoch(
+            model, [batch], CosineVPSchedule(), torch.optim.Adam(model.parameters(), lr=1e-3),
+            stats, config, torch.device("cpu"), lambda_epoch=0.0,
+            include_fz_channel=True, include_type_channel=False,
+            epoch=2, total_epochs=2, phase="test",
+        )
+        self.assertGreater(result["gradient"], 0.0)
+        self.assertTrue(torch.isfinite(torch.tensor(result["loss"])))
 
     def test_constitutive_loss_matches_exported_shell_convention(self) -> None:
         std = torch.ones(1, 13, 1, 1)
@@ -214,8 +270,12 @@ class FlowMatchingTests(unittest.TestCase):
                 "layers_per_block": 1, "block_out_channels": [32],
                 "down_block_types": ["DownBlock2D"], "up_block_types": ["UpBlock2D"]}
         architect = build_unet(base)
-        engineer = build_unet({**base, "kind": "parallel_pb_unet", "in_channels": 2,
-                               "out_channels": 13, "branch_channels": {"u": 1, "m": 6, "f": 6}})
+        engineer = build_unet({
+            "kind": "hybrid_fourier_unet", "sample_size": 8, "in_channels": 2,
+            "out_channels": 13, "base_channels": 8, "spectral_modes": 2,
+            "spectral_layers": 1, "fft_padding": 1, "time_embedding_dim": 32,
+            "branch_channels": {"u": 1, "m": 6, "f": 6},
+        })
         time = model_time(0.375, 1, torch.device("cpu"))
         with torch.no_grad():
             self.assertEqual(tuple(architect(torch.randn(1, 1, 8, 8), time).sample.shape), (1, 1, 8, 8))

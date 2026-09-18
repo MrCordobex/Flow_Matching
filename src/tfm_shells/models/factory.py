@@ -6,12 +6,26 @@ import torch
 from diffusers import UNet2DModel
 
 from tfm_shells.models.equino import EquiNOModel
+from tfm_shells.models.hybrid_fourier_unet import HybridFourierUNet
 from tfm_shells.models.parallel_pb_unet import ParallelPBUNet
 from tfm_shells.models.shell_weakrefine_operator import ShellWeakRefineOperator
 
 
 def build_unet(model_config: dict[str, Any]) -> torch.nn.Module:
     kind = str(model_config.get("kind", "unet"))
+    if kind == "hybrid_fourier_unet":
+        return HybridFourierUNet(
+            sample_size=int(model_config["sample_size"]),
+            in_channels=int(model_config["in_channels"]),
+            out_channels=int(model_config["out_channels"]),
+            base_channels=int(model_config.get("base_channels", 32)),
+            spectral_modes=int(model_config.get("spectral_modes", 8)),
+            spectral_layers=int(model_config.get("spectral_layers", 2)),
+            fft_padding=int(model_config.get("fft_padding", 4)),
+            time_embedding_dim=int(model_config.get("time_embedding_dim", 128)),
+            dropout=float(model_config.get("dropout", 0.05)),
+            branch_channels=model_config.get("branch_channels"),
+        )
     if kind == "parallel_pb_unet":
         return ParallelPBUNet(
             sample_size=int(model_config["sample_size"]),

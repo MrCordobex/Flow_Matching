@@ -71,10 +71,10 @@ def load_sampling_context(config: dict[str, Any], device: torch.device) -> Sampl
         raise ValueError("Architect and Engineer checkpoints use different VP cosine schedules")
     if int(arch_ckpt["model_config"]["in_channels"]) != 1 or int(arch_ckpt["model_config"]["out_channels"]) != 1:
         raise ValueError("Architect checkpoint must use one input and one output channel")
-    if (eng_ckpt["model_config"].get("kind") != "parallel_pb_unet"
+    if (eng_ckpt["model_config"].get("kind") not in {"parallel_pb_unet", "hybrid_fourier_unet"}
             or int(eng_ckpt["model_config"]["in_channels"]) != 2
             or int(eng_ckpt["model_config"]["out_channels"]) != 13):
-        raise ValueError("Engineer checkpoint must be the solid-only, two-input, three-branch PBUNet")
+        raise ValueError("Engineer checkpoint must be a solid-only, two-input, three-branch surrogate")
     architect = build_unet(arch_ckpt["model_config"]).to(device)
     engineer = build_unet(eng_ckpt["model_config"]).to(device)
     architect.load_state_dict(arch_ckpt["model_state_dict"])

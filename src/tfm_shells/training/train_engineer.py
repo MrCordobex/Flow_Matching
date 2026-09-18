@@ -34,6 +34,7 @@ from tfm_shells.training.common import (
 )
 from tfm_shells.utils.io import save_json
 from tfm_shells.utils.physics import (
+    balanced_gradient_loss,
     balanced_supervised_loss,
     build_active_refinement_mask,
     branchwise_supervised_losses,
@@ -104,6 +105,7 @@ def _run_epoch(
     total_mse = 0.0
     total_phys = 0.0
     total_constitutive = 0.0
+    total_gradient = 0.0
     total_weak = 0.0
     total_refine = 0.0
     total_uncertainty = 0.0
@@ -123,6 +125,7 @@ def _run_epoch(
     refine_lambda_epoch = _nested_epoch_lambda(config["training"], "active_refinement", epoch - 1)
     constitutive_cfg = config["training"].get("constitutive", {})
     constitutive_lambda_epoch = _nested_epoch_lambda(config["training"], "constitutive", epoch - 1)
+    gradient_lambda_epoch = _nested_epoch_lambda(config["training"], "gradient", epoch - 1)
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
@@ -182,6 +185,11 @@ def _run_epoch(
                 else:
                     constitutive_loss = torch.tensor(0.0, device=device)
 
+                if gradient_lambda_epoch > 0.0:
+                    gradient_loss = balanced_gradient_loss(pred_norm, physics_clean)
+                else:
+                    gradient_loss = torch.tensor(0.0, device=device)
+
                 if lambda_epoch > 0.0:
                     phys_per_sample = compute_physical_residual(pred_norm, p_mean, p_std, ds, dv, fz_real)
                     weighted_phys = (phys_per_sample * (1.0 - time).pow(power)).mean()
@@ -226,6 +234,7 @@ def _run_epoch(
                 loss = (
                     loss_mse
                     + constitutive_lambda_epoch * constitutive_loss
+                    + gradient_lambda_epoch * gradient_loss
                     + lambda_epoch * weighted_phys
                     + weak_lambda_epoch * weak_loss
                     + refine_lambda_epoch * refine_loss
@@ -255,6 +264,7 @@ def _run_epoch(
             total_mse += float(loss_mse.item()) * batch_size
             total_phys += float(weighted_phys.item()) * batch_size
             total_constitutive += float(constitutive_loss.item()) * batch_size
+            total_gradient += float(gradient_loss.item()) * batch_size
             total_weak += float(weak_loss.item()) * batch_size
             total_refine += float(refine_loss.item()) * batch_size
             total_uncertainty += float(mean_uncertainty.item()) * batch_size
@@ -280,6 +290,7 @@ def _run_epoch(
         "mse": total_mse / max(total_items, 1),
         "phys": total_phys / max(total_items, 1),
         "constitutive": total_constitutive / max(total_items, 1),
+        "gradient": total_gradient / max(total_items, 1),
         "weak": total_weak / max(total_items, 1),
         "refine": total_refine / max(total_items, 1),
         "uncertainty": total_uncertainty / max(total_items, 1),
@@ -415,10 +426,10 @@ def train_engineer(
 
     model = build_unet(config["model"]).to(device)
     model_parameters = count_parameters(model)
-    if (config["model"].get("kind") != "parallel_pb_unet"
+    if (config["model"].get("kind") not in {"parallel_pb_unet", "hybrid_fourier_unet"}
             or not bool(config["data"]["include_fz_channel"])
             or int(config["model"]["out_channels"]) != 13):
-        raise ValueError("Flow Engineer requires the three-branch PBUNet with fz input.")
+        raise ValueError("VP Engineer requires a three-branch surrogate with fz input.")
     expected_in_channels = 1 + int(bool(config["data"]["include_fz_channel"])) + int(conditioned_on_type)
     if int(config["model"]["in_channels"]) != expected_in_channels:
         raise ValueError(
@@ -537,6 +548,8 @@ def train_engineer(
                 "val_phys": val_metrics["phys"],
                 "train_constitutive": train_metrics["constitutive"],
                 "val_constitutive": val_metrics["constitutive"],
+                "train_gradient": train_metrics["gradient"],
+                "val_gradient": val_metrics["gradient"],
                 "train_weak": train_metrics["weak"],
                 "val_weak": val_metrics["weak"],
                 "train_refine": train_metrics["refine"],
@@ -557,6 +570,7 @@ def train_engineer(
                 "val_flexion_mse": val_metrics["flexion_mse"],
                 "lambda_epoch": lambda_epoch,
                 "constitutive_lambda_epoch": _nested_epoch_lambda(config["training"], "constitutive", epoch - 1),
+                "gradient_lambda_epoch": _nested_epoch_lambda(config["training"], "gradient", epoch - 1),
                 "learning_rate": current_lr,
             }
             history_rows.append(row)
@@ -602,6 +616,7 @@ def train_engineer(
                         f"train_phys={format_metric(train_metrics['phys'])}",
                         f"val_phys={format_metric(val_metrics['phys'])}",
                         f"val_constitutive={format_metric(val_metrics['constitutive'])}",
+                        f"val_gradient={format_metric(val_metrics['gradient'])}",
                         f"train_weak={format_metric(train_metrics['weak'])}",
                         f"val_weak={format_metric(val_metrics['weak'])}",
                         f"val_refine={format_metric(val_metrics['refine'])}",
@@ -636,6 +651,7 @@ def train_engineer(
                 ("train_loss", "val_loss"),
                 ("train_mse", "val_mse"),
                 ("train_constitutive", "val_constitutive"),
+                ("train_gradient", "val_gradient"),
                 ("train_mf_mae", "val_mf_mae"),
                 ("train_weak", "val_weak"),
             ],

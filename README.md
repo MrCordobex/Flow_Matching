@@ -1,18 +1,19 @@
 # Difusión VP + DDIM para láminas sólidas
 
-Esta carpeta replica el pipeline principal de `TFM` para láminas **solid** de 64 × 64. Conserva el Engineer `parallel_pb_unet` de tres ramas y 13 campos físicos. Architect e Engineer usan el mismo proceso de difusión VP coseno del script `../Code/Prueba/diffusion_exotic.py`. El Architect predice `v` y genera con DDIM.
+Esta carpeta replica el pipeline principal de `TFM` para láminas **solid** de 64 × 64. El Engineer predeterminado es `hybrid_fourier_unet`: un tronco compartido con convoluciones locales, mezclado espectral y tres cabezas para los 13 campos físicos. Architect e Engineer usan el mismo proceso de difusión VP coseno del script `../Code/Prueba/diffusion_exotic.py`. El Architect predice `v` y genera con DDIM.
 
 ## Método
 
 - Se normaliza `z` a `[-1,1]` con estadísticas del train y se toma `ε ~ N(0,I)`.
 - El calendario coseno continuo define `φ(t)=(t+s)/(1+s)·π/2`, `α=cos φ` y `σ=sin φ`; `x_t=α z+σ ε` y el objetivo del Architect es `v=α ε−σ z`. `t=0` representa geometría casi limpia y `t=1` ruido puro. El tiempo se muestrea de forma estratificada por lote.
 - Se conserva la arquitectura `UNet2DModel` original de un canal. Su embedding temporal recibe `999t`. El muestreo DDIM recorre `t=1→0`, con `eta=0` por defecto, malla cuadrática y pesos EMA del Architect.
-- El Engineer de tres UNet aprende **sobre los mismos estados VP y el mismo calendario** que el Architect: recibe `(x_t, fz)` y `999t`, y predice `uz`, seis campos de membrana y seis de flexión. Su pérdida supervisada da un tercio del peso a cada rama: `MSE_uz/3 + MSE_membrana/3 + MSE_flexión/3`, con canales normalizados usando solo el conjunto de entrenamiento. El residuo físico global recibe peso `(1−t)^p`, porque la geometría limpia está en `t=0`.
+- El Engineer aprende **sobre los mismos estados VP y el mismo calendario** que el Architect: recibe `(x_t, fz)` y `999t`, y predice `uz`, seis campos de membrana y seis de flexión. Su tronco U-Net comparte información entre las ramas: los bloques de Fourier mezclan información global a resoluciones 32 × 32 y 16 × 16, mientras las convoluciones 3 × 3 y las conexiones entre escalas conservan detalles locales. Se añaden coordenadas normalizadas y un embedding temporal continuo. El FFT usa un halo replicado para reducir la discontinuidad periódica de los bordes. Esta combinación está inspirada en [FNO](https://arxiv.org/abs/2010.08895) y [U-FNO](https://arxiv.org/abs/2109.03697); no supone que sus resultados en otros PDE se reproduzcan en estas láminas.
+- La pérdida supervisada da un tercio del peso a cada rama: `MSE_uz/3 + MSE_membrana/3 + MSE_flexión/3`, con canales normalizados usando solo el conjunto de entrenamiento. Una pérdida de diferencias espaciales, igualmente equilibrada por ramas, supervisa la estructura local. Ambas pérdidas se calculan contra los campos FEM. El residuo físico global recibe peso `(1−t)^p`, porque la geometría limpia está en `t=0`.
 - La pérdida constitutiva opcional, activada en `configs/engineer.yaml`, compara los esfuerzos de membrana con `A ε` y los momentos con `D κ` para material elástico isótropo. Sus residuos se dividen por la desviación típica de cada salida FEM antes de elevar al cuadrado; membrana y flexión reciben igual peso. `E=30 GPa`, `ν=0,2` y `h=0,1 m` coinciden con los datos sólidos revisados. Las componentes `12` llevan el factor `1/2` de la convención del dataset. Ajusta estos parámetros si cambias de material, espesor o convención FEM.
 - La evaluación del Engineer sobre la geometría limpia usa `t=0` tanto para la figura como para `mf_mae`.
 - El guiado evalúa directamente el Engineer en el mismo estado VP del Architect. Modifica la predicción `v` con `+σ(t)·clip(γ w(1−t)∇(1−MF)^2, ±grad_clip)` antes del paso DDIM; el signo produce descenso del objetivo en la estimación de la muestra limpia. `γ` debe ajustarse experimentalmente.
 
-El Architect no usa `fz` como entrada. La carga actúa en el Engineer y en el guiado, igual que en el pipeline original sin condición tipológica. Ambos checkpoints deben indicar el mismo `cosine_s`; los antiguos checkpoints de Flow Matching lineal y DDPM se rechazan. Hay que volver a entrenar ambos modelos. El *Stable Target Field* del ejemplo bidimensional no se traslada a imágenes 64 × 64: el Architect usa el objetivo `v` estándar. La codificación espacial de Fourier del MLP 2D tampoco se traslada literalmente; aquí se conserva la UNet de imágenes.
+El Architect no usa `fz` como entrada. La carga actúa en el Engineer y en el guiado, igual que en el pipeline original sin condición tipológica. Ambos checkpoints deben indicar el mismo `cosine_s`; los antiguos checkpoints de Flow Matching lineal y DDPM se rechazan. Hay que entrenar el nuevo Engineer; los pesos de la PBUNet anterior no cargan en la nueva arquitectura. El *Stable Target Field* del ejemplo bidimensional no se traslada a imágenes 64 × 64: el Architect usa el objetivo `v` estándar.
 
 ## Datos y requisitos
 
@@ -35,7 +36,7 @@ La CLI equivalente es `uv run tfm-shells architect|engineer|sample --config ...`
 
 El muestreo por defecto usa 50 pasos DDIM, `eta=0`, malla `quadratic` y `γ=1`; son valores iniciales para probar, **no resultados calibrados**. Cambia `sampling.num_inference_steps`, `sampling.time_spacing` (`uniform` o `quadratic`), `sampling.eta` y `sampling.guidance_scale` en el YAML. DDIM hace una evaluación del Architect por paso y, con guiado, una del Engineer.
 
-Las comprobaciones locales se ejecutan con `uv run python -m unittest discover -s tests -v`.
+Las comprobaciones locales se ejecutan con `uv run python -m unittest discover -s tests -v`. La arquitectura y los pesos de las pérdidas son hipótesis para probar. Compara `val_uz_mse`, `val_membrane_mse`, `val_flexion_mse`, `val_mf_mae` y la evaluación FEM externa con la PBUNet anterior antes de concluir que mejora la predicción. La consistencia constitutiva sí se comprobó sobre campos FEM; la pérdida global de energía no equivale a imponer todo el equilibrio de la lámina.
 
 ## Comprobar la convergencia en menos pasos
 

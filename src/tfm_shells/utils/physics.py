@@ -50,6 +50,23 @@ def balanced_supervised_loss(branch_losses: dict[str, torch.Tensor]) -> torch.Te
     ) / 3.0
 
 
+def balanced_gradient_loss(pred_norm: torch.Tensor, target_norm: torch.Tensor) -> torch.Tensor:
+    """Match local field differences, giving the three output branches equal weight.
+
+    Both inputs are normalized per channel with training-only statistics. Grid
+    spacing cancels because the two fields use the same discrete mesh.
+    """
+    if pred_norm.shape != target_norm.shape or pred_norm.shape[1] != 13:
+        raise ValueError("Gradient loss expects matching 13-channel fields")
+    error = pred_norm - target_norm
+    terms = []
+    for branch in (error[:, :1], error[:, 1:7], error[:, 7:13]):
+        dx = branch[..., 1:] - branch[..., :-1]
+        dy = branch[..., 1:, :] - branch[..., :-1, :]
+        terms.append(0.5 * (dx.square().mean() + dy.square().mean()))
+    return sum(terms) / 3.0
+
+
 def compute_constitutive_loss(
     pred_norm: torch.Tensor,
     p_mean: torch.Tensor,
