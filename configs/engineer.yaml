@@ -49,6 +49,13 @@ training:
   lambda_max: 1.0e-3
   warmup_epochs: 10
   timestep_power: 2.0
+  constitutive:
+    enabled: true
+    young_modulus: 3.0e10
+    poisson_ratio: 0.2
+    thickness: 0.1
+    lambda_max: 0.05
+    warmup_epochs: 10
 
 mlflow:
   tracking_uri: ./mlruns

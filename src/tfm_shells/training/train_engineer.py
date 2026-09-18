@@ -34,8 +34,10 @@ from tfm_shells.training.common import (
 )
 from tfm_shells.utils.io import save_json
 from tfm_shells.utils.physics import (
+    balanced_supervised_loss,
     build_active_refinement_mask,
     branchwise_supervised_losses,
+    compute_constitutive_loss,
     compute_membrane_factor_from_prediction,
     compute_physical_residual,
     compute_energy_residual_map,
@@ -100,6 +102,7 @@ def _run_epoch(
     total_loss = 0.0
     total_mse = 0.0
     total_phys = 0.0
+    total_constitutive = 0.0
     total_weak = 0.0
     total_refine = 0.0
     total_uncertainty = 0.0
@@ -117,6 +120,8 @@ def _run_epoch(
     use_uncertainty_weighting = bool(config["training"].get("uncertainty_weighting", False))
     weak_lambda_epoch = _nested_epoch_lambda(config["training"], "weak_form", epoch - 1)
     refine_lambda_epoch = _nested_epoch_lambda(config["training"], "active_refinement", epoch - 1)
+    constitutive_cfg = config["training"].get("constitutive", {})
+    constitutive_lambda_epoch = _nested_epoch_lambda(config["training"], "constitutive", epoch - 1)
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
@@ -153,13 +158,28 @@ def _run_epoch(
                     log_variance = log_variance.expand(-1, pred_norm.shape[1], -1, -1)
 
                 sq_error = (pred_norm - physics_clean).square()
+                branch_losses = branchwise_supervised_losses(pred_norm, physics_clean)
                 if use_uncertainty_weighting and log_variance is not None:
-                    loss_mse = (0.5 * (torch.exp(-log_variance) * sq_error + log_variance)).mean()
+                    weighted_error = 0.5 * (torch.exp(-log_variance) * sq_error + log_variance)
+                    loss_mse = (
+                        weighted_error[:, :1].mean()
+                        + weighted_error[:, 1:7].mean()
+                        + weighted_error[:, 7:13].mean()
+                    ) / 3.0
                     mean_uncertainty = torch.exp(log_variance.detach()).mean()
                 else:
-                    loss_mse = sq_error.mean()
+                    loss_mse = balanced_supervised_loss(branch_losses)
                     mean_uncertainty = torch.tensor(0.0, device=device)
-                branch_losses = branchwise_supervised_losses(pred_norm, physics_clean)
+
+                if bool(constitutive_cfg.get("enabled", False)):
+                    constitutive_loss = compute_constitutive_loss(
+                        pred_norm, p_mean, p_std,
+                        young_modulus=float(constitutive_cfg["young_modulus"]),
+                        poisson_ratio=float(constitutive_cfg["poisson_ratio"]),
+                        thickness=float(constitutive_cfg["thickness"]),
+                    )
+                else:
+                    constitutive_loss = torch.tensor(0.0, device=device)
 
                 if lambda_epoch > 0.0:
                     phys_per_sample = compute_physical_residual(pred_norm, p_mean, p_std, ds, dv, fz_real)
@@ -204,6 +224,7 @@ def _run_epoch(
 
                 loss = (
                     loss_mse
+                    + constitutive_lambda_epoch * constitutive_loss
                     + lambda_epoch * weighted_phys
                     + weak_lambda_epoch * weak_loss
                     + refine_lambda_epoch * refine_loss
@@ -217,14 +238,14 @@ def _run_epoch(
                 scaler.update()
 
             with torch.no_grad():
-                input_channels_t0 = [z_clean]
+                input_channels_t1 = [z_clean]
                 if include_fz_channel:
-                    input_channels_t0.append(fz_cond)
+                    input_channels_t1.append(fz_cond)
                 if include_type_channel:
-                    input_channels_t0.append(type_channel)
-                model_input_t0 = torch.cat(input_channels_t0, dim=1)
-                pred_t0 = model(model_input_t0, torch.zeros(batch_size, device=device, dtype=torch.long)).sample
-                mf_pred_map = compute_membrane_factor_from_prediction(pred_t0, p_mean, p_std)
+                    input_channels_t1.append(type_channel)
+                model_input_t1 = torch.cat(input_channels_t1, dim=1)
+                pred_t1 = model(model_input_t1, model_time(1.0, batch_size, device)).sample
+                mf_pred_map = compute_membrane_factor_from_prediction(pred_t1, p_mean, p_std)
                 mf_pred_mean = mf_pred_map.mean(dim=(1, 2, 3))
                 mf_true_mean = mf_true.mean(dim=(1, 2, 3))
                 mf_mae = torch.abs(mf_pred_map - mf_true).mean(dim=(1, 2, 3))
@@ -232,6 +253,7 @@ def _run_epoch(
             total_loss += float(loss.item()) * batch_size
             total_mse += float(loss_mse.item()) * batch_size
             total_phys += float(weighted_phys.item()) * batch_size
+            total_constitutive += float(constitutive_loss.item()) * batch_size
             total_weak += float(weak_loss.item()) * batch_size
             total_refine += float(refine_loss.item()) * batch_size
             total_uncertainty += float(mean_uncertainty.item()) * batch_size
@@ -256,6 +278,7 @@ def _run_epoch(
         "loss": total_loss / max(total_items, 1),
         "mse": total_mse / max(total_items, 1),
         "phys": total_phys / max(total_items, 1),
+        "constitutive": total_constitutive / max(total_items, 1),
         "weak": total_weak / max(total_items, 1),
         "refine": total_refine / max(total_items, 1),
         "uncertainty": total_uncertainty / max(total_items, 1),
@@ -506,6 +529,8 @@ def train_engineer(
                 "val_mse": val_metrics["mse"],
                 "train_phys": train_metrics["phys"],
                 "val_phys": val_metrics["phys"],
+                "train_constitutive": train_metrics["constitutive"],
+                "val_constitutive": val_metrics["constitutive"],
                 "train_weak": train_metrics["weak"],
                 "val_weak": val_metrics["weak"],
                 "train_refine": train_metrics["refine"],
@@ -525,6 +550,7 @@ def train_engineer(
                 "train_flexion_mse": train_metrics["flexion_mse"],
                 "val_flexion_mse": val_metrics["flexion_mse"],
                 "lambda_epoch": lambda_epoch,
+                "constitutive_lambda_epoch": _nested_epoch_lambda(config["training"], "constitutive", epoch - 1),
                 "learning_rate": current_lr,
             }
             history_rows.append(row)
@@ -568,6 +594,7 @@ def train_engineer(
                         f"val_mse={format_metric(val_metrics['mse'])}",
                         f"train_phys={format_metric(train_metrics['phys'])}",
                         f"val_phys={format_metric(val_metrics['phys'])}",
+                        f"val_constitutive={format_metric(val_metrics['constitutive'])}",
                         f"train_weak={format_metric(train_metrics['weak'])}",
                         f"val_weak={format_metric(val_metrics['weak'])}",
                         f"val_refine={format_metric(val_metrics['refine'])}",
@@ -601,6 +628,7 @@ def train_engineer(
             metrics=[
                 ("train_loss", "val_loss"),
                 ("train_mse", "val_mse"),
+                ("train_constitutive", "val_constitutive"),
                 ("train_mf_mae", "val_mf_mae"),
                 ("train_weak", "val_weak"),
             ],

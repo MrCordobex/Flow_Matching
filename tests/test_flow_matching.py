@@ -10,9 +10,55 @@ from tfm_shells.models.factory import build_unet
 from tfm_shells.sampling.guided import SamplingContext, generate_samples
 from tfm_shells.training.train_architect import _run_epoch as run_architect_epoch
 from tfm_shells.training.train_engineer import _run_epoch
+from tfm_shells.utils.physics import (
+    balanced_supervised_loss,
+    branchwise_supervised_losses,
+    compute_constitutive_loss,
+)
 
 
 class FlowMatchingTests(unittest.TestCase):
+    def test_balanced_supervision_weights_each_branch_equally(self) -> None:
+        pred = torch.zeros(1, 13, 2, 2)
+        pred[:, 0] = 1.0
+        target = torch.zeros_like(pred)
+        losses = branchwise_supervised_losses(pred, target)
+        self.assertAlmostEqual(float(balanced_supervised_loss(losses)), 1.0 / 3.0)
+        self.assertAlmostEqual(float((pred - target).square().mean()), 1.0 / 13.0)
+
+    def test_constitutive_loss_matches_exported_shell_convention(self) -> None:
+        std = torch.ones(1, 13, 1, 1)
+        std[:, 1:4] = 1e-5
+        std[:, 4:7] = 1e4
+        std[:, 7:10] = 1e-4
+        std[:, 10:13] = 1e3
+        mean = torch.zeros_like(std)
+        real = torch.zeros(1, 13, 2, 2)
+        real[:, 1:4] = torch.tensor([1e-5, 2e-5, 3e-5]).view(1, 3, 1, 1)
+        real[:, 7:10] = torch.tensor([1e-4, 2e-4, 3e-4]).view(1, 3, 1, 1)
+        a = 30e9 * 0.1 / (1 - 0.2**2)
+        d = 30e9 * 0.1**3 / (12 * (1 - 0.2**2))
+        real[:, 4:7] = torch.tensor([
+            a * (1e-5 + 0.2 * 2e-5),
+            a * (2e-5 + 0.2 * 1e-5),
+            a * 0.8 * 0.5 * 3e-5,
+        ]).view(1, 3, 1, 1)
+        real[:, 10:13] = torch.tensor([
+            d * (1e-4 + 0.2 * 2e-4),
+            d * (2e-4 + 0.2 * 1e-4),
+            d * 0.8 * 0.5 * 3e-4,
+        ]).view(1, 3, 1, 1)
+        exact = (real / std).detach().requires_grad_()
+        loss = compute_constitutive_loss(exact, mean, std, 30e9, 0.2, 0.1)
+        self.assertLess(float(loss.detach()), 1e-11)
+        inconsistent = exact.detach().clone()
+        inconsistent[:, 4] += 1.0
+        inconsistent.requires_grad_()
+        loss = compute_constitutive_loss(inconsistent, mean, std, 30e9, 0.2, 0.1)
+        self.assertGreater(float(loss.detach()), 0.1)
+        loss.backward()
+        self.assertGreater(float(inconsistent.grad[:, 4].abs().sum().detach()), 0.0)
+
     def test_constant_velocity_reaches_target_with_few_steps(self) -> None:
         initial = torch.zeros(2, 1, 4, 4)
         for solver in ("euler", "heun"):
@@ -70,13 +116,17 @@ class FlowMatchingTests(unittest.TestCase):
         stats = {"physics_mean": torch.zeros(13, 1, 1).tolist(),
                  "physics_std": torch.ones(13, 1, 1).tolist()}
         config = {"training": {"mixed_precision": False, "timestep_power": 2.0,
-                               "warmup_epochs": 10, "epochs": 20, "grad_clip_norm": 1.0}}
+                               "warmup_epochs": 10, "epochs": 20, "grad_clip_norm": 1.0,
+                               "constitutive": {"enabled": True, "young_modulus": 1.0,
+                                                "poisson_ratio": 0.2, "thickness": 1.0,
+                                                "lambda_max": 0.05, "warmup_epochs": 0}}}
         result = _run_epoch(model, [batch], optimizer, stats, config, torch.device("cpu"),
                             lambda_epoch=0.0, include_fz_channel=True,
                             include_type_channel=False, epoch=1, total_epochs=20, phase="test")
         self.assertGreaterEqual(result["mse"], 0.0)
+        self.assertGreaterEqual(result["constitutive"], 0.0)
         self.assertEqual(tuple(model.last_time.shape), (2,))
-        self.assertTrue(torch.all(model.last_time >= 0) and torch.all(model.last_time <= 999))
+        self.assertTrue(torch.all(model.last_time == 999))
 
     def test_architect_training_interface_uses_velocity_target(self) -> None:
         class TinyArchitect(torch.nn.Module):

@@ -41,6 +41,52 @@ def branchwise_supervised_losses(
     }
 
 
+def balanced_supervised_loss(branch_losses: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Give displacement, membrane and flexion equal total weight."""
+    return (
+        branch_losses["uz_mse"]
+        + branch_losses["membrane_mse"]
+        + branch_losses["flexion_mse"]
+    ) / 3.0
+
+
+def compute_constitutive_loss(
+    pred_norm: torch.Tensor,
+    p_mean: torch.Tensor,
+    p_std: torch.Tensor,
+    young_modulus: float,
+    poisson_ratio: float,
+    thickness: float,
+) -> torch.Tensor:
+    """Plane-stress isotropic shell resultants, compared in normalized force units.
+
+    For the exported off-diagonal components, N12 = A(1-nu)se12/2 and
+    M12 = D(1-nu)sk12/2. This was checked against the solid NPZ fields.
+    """
+    if young_modulus <= 0 or thickness <= 0 or not (-1.0 < poisson_ratio < 0.5):
+        raise ValueError("Constitutive material needs E>0, h>0 and -1<nu<0.5.")
+    pred = pred_norm.float()
+    mean = p_mean.float()
+    std = p_std.float()
+    real = denormalize_physics(pred, mean, std)
+    a = young_modulus * thickness / (1.0 - poisson_ratio**2)
+    d = young_modulus * thickness**3 / (12.0 * (1.0 - poisson_ratio**2))
+
+    def resultant(start: int, stiffness: float) -> torch.Tensor:
+        e11, e22, e12 = real[:, start:start + 1], real[:, start + 1:start + 2], real[:, start + 2:start + 3]
+        return torch.cat((
+            stiffness * (e11 + poisson_ratio * e22),
+            stiffness * (e22 + poisson_ratio * e11),
+            stiffness * (1.0 - poisson_ratio) * 0.5 * e12,
+        ), dim=1)
+
+    membrane_expected = resultant(1, a)
+    flexion_expected = resultant(7, d)
+    membrane_error = (real[:, 4:7] - membrane_expected) / std[:, 4:7]
+    flexion_error = (real[:, 10:13] - flexion_expected) / std[:, 10:13]
+    return 0.5 * (membrane_error.square().mean() + flexion_error.square().mean())
+
+
 def compute_energy_terms_from_real_physics(
     physics_real: torch.Tensor,
     ds: torch.Tensor,
