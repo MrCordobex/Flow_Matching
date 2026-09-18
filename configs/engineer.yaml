@@ -35,7 +35,8 @@ model:
     - UpBlock2D
     - UpBlock2D
     - UpBlock2D
-  method: linear_flow_matching
+  method: vp_conditioned_surrogate
+  cosine_s: 0.008
 
 training:
   epochs: 60
@@ -59,7 +60,7 @@ training:
 
 mlflow:
   tracking_uri: ./mlruns
-  experiment_name: engineer_flow_pbunet_solid
+  experiment_name: engineer_vp_pbunet_solid
   run_name_prefix: engineer
   tags:
     model_role: engineer

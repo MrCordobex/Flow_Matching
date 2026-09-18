@@ -18,7 +18,7 @@ from tfm_shells.config import load_config, resolve_project_path
 from tfm_shells.data.conditioning import split_records_balanced_validation
 from tfm_shells.data.dataset import ShellDataset, compute_normalization_stats
 from tfm_shells.data.index import build_dataset_index, dataset_summary, filter_records, split_records
-from tfm_shells.flow import model_time, sample_flow_path
+from tfm_shells.vp_diffusion import CosineVPSchedule, sample_vp_path, vp_model_time
 from tfm_shells.models.factory import build_unet, count_parameters
 from tfm_shells.training.common import (
     expand_physics_stats,
@@ -81,6 +81,7 @@ def _nested_epoch_lambda(
 def _run_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
+    schedule: CosineVPSchedule,
     optimizer: torch.optim.Optimizer | None,
     stats: dict[str, Any],
     config: dict[str, Any],
@@ -139,7 +140,7 @@ def _run_epoch(
 
             p_mean, p_std = expand_physics_stats(stats, batch_size, device)
 
-            z_noisy, time, _ = sample_flow_path(z_clean)
+            z_noisy, time, _ = sample_vp_path(z_clean, schedule)
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -151,7 +152,7 @@ def _run_epoch(
                 if include_type_channel:
                     input_channels.append(type_channel)
                 model_input = torch.cat(input_channels, dim=1)
-                model_output = model(model_input, model_time(time, batch_size, device))
+                model_output = model(model_input, vp_model_time(time, batch_size, device))
                 pred_norm = model_output.sample
                 log_variance = getattr(model_output, "log_variance", None)
                 if log_variance is not None and log_variance.shape[1] == 1:
@@ -183,7 +184,7 @@ def _run_epoch(
 
                 if lambda_epoch > 0.0:
                     phys_per_sample = compute_physical_residual(pred_norm, p_mean, p_std, ds, dv, fz_real)
-                    weighted_phys = (phys_per_sample * time.pow(power)).mean()
+                    weighted_phys = (phys_per_sample * (1.0 - time).pow(power)).mean()
                 else:
                     weighted_phys = torch.tensor(0.0, device=device)
 
@@ -238,14 +239,14 @@ def _run_epoch(
                 scaler.update()
 
             with torch.no_grad():
-                input_channels_t1 = [z_clean]
+                input_channels_t0 = [z_clean]
                 if include_fz_channel:
-                    input_channels_t1.append(fz_cond)
+                    input_channels_t0.append(fz_cond)
                 if include_type_channel:
-                    input_channels_t1.append(type_channel)
-                model_input_t1 = torch.cat(input_channels_t1, dim=1)
-                pred_t1 = model(model_input_t1, model_time(1.0, batch_size, device)).sample
-                mf_pred_map = compute_membrane_factor_from_prediction(pred_t1, p_mean, p_std)
+                    input_channels_t0.append(type_channel)
+                model_input_t0 = torch.cat(input_channels_t0, dim=1)
+                pred_t0 = model(model_input_t0, vp_model_time(0.0, batch_size, device)).sample
+                mf_pred_map = compute_membrane_factor_from_prediction(pred_t0, p_mean, p_std)
                 mf_pred_mean = mf_pred_map.mean(dim=(1, 2, 3))
                 mf_true_mean = mf_true.mean(dim=(1, 2, 3))
                 mf_mae = torch.abs(mf_pred_map - mf_true).mean(dim=(1, 2, 3))
@@ -317,8 +318,8 @@ def _save_validation_figure(
         if include_type_channel:
             input_channels.append(type_channel)
         model_input = torch.cat(input_channels, dim=1)
-        pred_t1 = model(model_input, model_time(1.0, batch_size, device)).sample
-        mf_pred = compute_membrane_factor_from_prediction(pred_t1, p_mean, p_std)
+        pred_t0 = model(model_input, vp_model_time(0.0, batch_size, device)).sample
+        mf_pred = compute_membrane_factor_from_prediction(pred_t0, p_mean, p_std)
 
     n_show = min(4, batch_size)
     figure, axes = plt.subplots(n_show, 3, figsize=(12, 3.2 * n_show))
@@ -353,6 +354,9 @@ def train_engineer(
     role: str = "engineer",
 ) -> dict[str, Any]:
     config = load_config(config_path)
+    if config["model"].get("method") != "vp_conditioned_surrogate":
+        raise ValueError("Engineer model.method must be vp_conditioned_surrogate")
+    vp_schedule = CosineVPSchedule(float(config["model"].get("cosine_s", 0.008)))
     seed_everything(int(config["seed"]))
     directories = prepare_run_directories(config, role=role)
     device = resolve_device(str(config["runtime"]["device"]))
@@ -365,7 +369,7 @@ def train_engineer(
         min_mf_mean=config["data"].get("min_mf_mean"),
     )
     if config["data"]["subset"] != "solid" or conditioned_on_type:
-        raise ValueError("This flow-matching repository trains only solid shells without a type channel.")
+        raise ValueError("This VP repository trains only solid shells without a type channel.")
     if balanced_validation:
         train_records, val_records = split_records_balanced_validation(
             filtered,
@@ -493,6 +497,7 @@ def train_engineer(
             train_metrics = _run_epoch(
                 model=model,
                 loader=train_loader,
+                schedule=vp_schedule,
                 optimizer=optimizer,
                 stats=stats,
                 config=config,
@@ -507,6 +512,7 @@ def train_engineer(
             val_metrics = _run_epoch(
                 model=model,
                 loader=val_loader,
+                schedule=vp_schedule,
                 optimizer=None,
                 stats=stats,
                 config=config,
@@ -562,7 +568,8 @@ def train_engineer(
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "model_config": config["model"],
-                "flow_config": {"path": "linear", "time_scale": 999.0, "base": "standard_normal"},
+                "diffusion_config": {"method": "cosine_vp_conditioned", "cosine_s": vp_schedule.s,
+                                     "time_scale": 999.0, "architect_method": "cosine_vp_v"},
                 "normalization_stats": stats,
                 "config_path": str(config["_meta"]["config_path"]),
                 "dataset_summary": splits["dataset_summary"],

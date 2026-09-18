@@ -1,8 +1,8 @@
-"""Physics-guided ODE sampling for the solid-shell flow model."""
+"""Physics-guided DDIM sampling for the solid-shell cosine VP model."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,7 @@ import torch
 from tqdm.auto import tqdm
 
 from tfm_shells.config import load_config, resolve_project_path, save_config
-from tfm_shells.flow import integrate_flow, model_time
+from tfm_shells.vp_diffusion import CosineVPSchedule, sample_ddim, vp_model_time
 from tfm_shells.models.factory import build_unet
 from tfm_shells.training.common import (
     bell_guidance_weight,
@@ -40,6 +40,7 @@ class SamplingContext:
     fz_condition: torch.Tensor
     device: torch.device
     source_file: Path
+    vp_schedule: CosineVPSchedule = field(default_factory=CosineVPSchedule)
 
 
 def _normalize(array: np.ndarray, low: float, high: float) -> np.ndarray:
@@ -51,10 +52,12 @@ def _architect_to_engineer(x: torch.Tensor, arch: dict, eng: dict) -> torch.Tens
     return 2.0 * (real - float(eng["z_min"])) / (float(eng["z_max"]) - float(eng["z_min"]) + 1e-8) - 1.0
 
 
-def _check_flow_checkpoint(ckpt: dict, role: str) -> None:
-    flow = ckpt.get("flow_config", {})
-    if flow.get("path") != "linear" or float(flow.get("time_scale", -1)) != 999.0:
-        raise ValueError(f"{role} checkpoint must be trained by this linear flow-matching pipeline")
+def _check_vp_checkpoint(ckpt: dict, role: str, method: str) -> dict[str, Any]:
+    diffusion = ckpt.get("diffusion_config", {})
+    if (diffusion.get("method") != method or float(diffusion.get("time_scale", -1)) != 999.0
+            or "cosine_s" not in diffusion):
+        raise ValueError(f"{role} checkpoint must use the cosine VP schedule ({method}); retrain older flow checkpoints")
+    return diffusion
 
 
 def load_sampling_context(config: dict[str, Any], device: torch.device) -> SamplingContext:
@@ -62,8 +65,10 @@ def load_sampling_context(config: dict[str, Any], device: torch.device) -> Sampl
     eng_path = resolve_project_path(config, config["engineer"]["checkpoint"])
     arch_ckpt = torch.load(arch_path, map_location=device, weights_only=False)
     eng_ckpt = torch.load(eng_path, map_location=device, weights_only=False)
-    _check_flow_checkpoint(arch_ckpt, "Architect")
-    _check_flow_checkpoint(eng_ckpt, "Engineer")
+    arch_diffusion = _check_vp_checkpoint(arch_ckpt, "Architect", "cosine_vp_v")
+    eng_diffusion = _check_vp_checkpoint(eng_ckpt, "Engineer", "cosine_vp_conditioned")
+    if float(arch_diffusion["cosine_s"]) != float(eng_diffusion["cosine_s"]):
+        raise ValueError("Architect and Engineer checkpoints use different VP cosine schedules")
     if int(arch_ckpt["model_config"]["in_channels"]) != 1 or int(arch_ckpt["model_config"]["out_channels"]) != 1:
         raise ValueError("Architect checkpoint must use one input and one output channel")
     if (eng_ckpt["model_config"].get("kind") != "parallel_pb_unet"
@@ -84,7 +89,8 @@ def load_sampling_context(config: dict[str, Any], device: torch.device) -> Sampl
     eng_stats = eng_ckpt["normalization_stats"]
     fz_normalized = _normalize(fz, float(eng_stats["fz_min"]), float(eng_stats["fz_max"]))
     fz_tensor = torch.from_numpy(fz_normalized).unsqueeze(0).to(device)
-    return SamplingContext(architect, engineer, arch_ckpt["normalization_stats"], eng_stats, fz_tensor, device, source)
+    return SamplingContext(architect, engineer, arch_ckpt["normalization_stats"], eng_stats,
+                           fz_tensor, device, source, CosineVPSchedule(float(arch_diffusion["cosine_s"])))
 
 
 def _guide_weight(config: dict[str, Any], t: float) -> float:
@@ -99,7 +105,7 @@ def _guide_weight(config: dict[str, Any], t: float) -> float:
 def _mf_from_engineer(context: SamplingContext, state: torch.Tensor, t: float) -> torch.Tensor:
     z_eng = _architect_to_engineer(state, context.architect_stats, context.engineer_stats)
     fz = context.fz_condition.expand(state.shape[0], -1, -1, -1)
-    prediction = context.engineer(torch.cat([z_eng, fz], dim=1), model_time(t, state.shape[0], context.device)).sample
+    prediction = context.engineer(torch.cat([z_eng, fz], dim=1), vp_model_time(t, state.shape[0], context.device)).sample
     mean = torch.as_tensor(context.engineer_stats["physics_mean"], dtype=torch.float32, device=context.device).unsqueeze(0)
     std = torch.as_tensor(context.engineer_stats["physics_std"], dtype=torch.float32, device=context.device).unsqueeze(0)
     real = prediction * std + mean
@@ -108,7 +114,7 @@ def _mf_from_engineer(context: SamplingContext, state: torch.Tensor, t: float) -
 
 def evaluate_clean_mf(context: SamplingContext, states: torch.Tensor) -> np.ndarray:
     with torch.no_grad():
-        return _mf_from_engineer(context, states, 1.0).cpu().numpy()
+        return _mf_from_engineer(context, states, 0.0).cpu().numpy()
 
 
 def generate_samples(
@@ -116,21 +122,25 @@ def generate_samples(
     config: dict[str, Any],
     initial: torch.Tensor,
     steps: int,
-    solver: str = "euler",
+    solver: str = "ddim",
     show_progress: bool = False,
 ) -> tuple[torch.Tensor, dict[str, list[float]]]:
     if initial.ndim != 4 or initial.shape[1] != 1:
         raise ValueError("initial noise must have shape (B, 1, H, W)")
+    if solver != "ddim":
+        raise ValueError("VP sampling requires solver='ddim'")
     scale = float(config["sampling"]["guidance_scale"])
     clip = float(config["sampling"]["grad_clip"])
+    eta = float(config["sampling"].get("eta", 0.0))
+    spacing = str(config["sampling"].get("time_spacing", "quadratic"))
     if clip <= 0 or scale < 0:
         raise ValueError("grad_clip must be positive and guidance_scale nonnegative")
     history: dict[str, list[float]] = {"t": [], "objective": [], "mf_mean": [], "grad_norm": [], "guide_weight": []}
     diagnostic: dict[str, float] = {}
 
-    def field(state: torch.Tensor, t: float) -> torch.Tensor:
+    def velocity_field(state: torch.Tensor, t: float) -> torch.Tensor:
         with torch.no_grad():
-            velocity = context.architect(state, model_time(t, state.shape[0], context.device)).sample
+            velocity = context.architect(state, vp_model_time(t, state.shape[0], context.device)).sample
         if scale == 0.0:
             diagnostic.update(objective=float("nan"), mf_mean=float("nan"), grad_norm=0.0, guide_weight=0.0)
             return velocity
@@ -139,7 +149,7 @@ def generate_samples(
             mf = _mf_from_engineer(context, state_req, t)
             per_sample = (1.0 - mf).square()
             grad = torch.autograd.grad(per_sample.sum(), state_req)[0]
-        weight = _guide_weight(config, t)
+        weight = _guide_weight(config, 1.0 - t)
         correction = torch.clamp(scale * weight * grad, -clip, clip)
         diagnostic.update(
             objective=float(per_sample.mean().detach()),
@@ -147,9 +157,10 @@ def generate_samples(
             grad_norm=float(correction.flatten(1).norm(dim=1).mean().detach()),
             guide_weight=weight,
         )
-        return velocity - correction.detach()
+        _, sigma = context.vp_schedule.alpha_sigma(torch.as_tensor(t, device=state.device))
+        return velocity + sigma * correction.detach()
 
-    progress = tqdm(total=steps, desc="flow sampling", disable=not show_progress)
+    progress = tqdm(total=steps, desc="VP DDIM sampling", disable=not show_progress)
 
     def record(index: int, t: float, state: torch.Tensor) -> None:
         history["t"].append(t)
@@ -158,7 +169,8 @@ def generate_samples(
         progress.update(1)
 
     try:
-        result = integrate_flow(field, initial, steps, solver, record)
+        result = sample_ddim(velocity_field, initial, steps, context.vp_schedule,
+                             spacing=spacing, eta=eta, step_callback=record)
     finally:
         progress.close()
     return result, history
@@ -181,7 +193,7 @@ def run_guided_sampling(config_path: str | Path) -> dict[str, Any]:
     height = int(context.architect.config.sample_size)
     initial = torch.randn((batch_size, 1, height, height), device=device)
     steps = int(config["sampling"]["num_inference_steps"])
-    solver = str(config["sampling"].get("solver", "euler"))
+    solver = str(config["sampling"].get("solver", "ddim"))
     states, history = generate_samples(context, config, initial, steps, solver, show_progress=True)
     samples = denormalize_samples(context, states)
     final_mf = evaluate_clean_mf(context, states)
@@ -210,8 +222,10 @@ def run_guided_sampling(config_path: str | Path) -> dict[str, Any]:
     plt.close(figure)
 
     summary = {
-        "method": "linear_flow_matching",
+        "method": "cosine_vp_v_ddim",
         "solver": solver,
+        "eta": float(config["sampling"].get("eta", 0.0)),
+        "time_spacing": str(config["sampling"].get("time_spacing", "quadratic")),
         "num_inference_steps": steps,
         "guidance_scale": float(config["sampling"]["guidance_scale"]),
         "samples_generated": batch_size,

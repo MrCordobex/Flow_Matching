@@ -30,7 +30,8 @@ model:
     - UpBlock2D
     - UpBlock2D
     - UpBlock2D
-  method: linear_flow_matching
+  method: vp_diffusion_v
+  cosine_s: 0.008
 
 training:
   epochs: 75
@@ -41,14 +42,16 @@ training:
   lr_factor: 0.5
   early_stopping_patience: 15
   mixed_precision: false
+  ema_decay: 0.999
   sample_every_n_epochs: 10
   sample_batch_size: 6
   sample_inference_steps: 50
-  sample_solver: euler
+  sample_time_spacing: quadratic
+  sample_eta: 0.0
 
 mlflow:
   tracking_uri: ./mlruns
-  experiment_name: architect_flow_solid
+  experiment_name: architect_vp_ddim_solid
   run_name_prefix: architect
   tags:
     model_role: architect

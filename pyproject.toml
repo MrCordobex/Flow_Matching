@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "tfm-shells"
 version = "0.1.0"
-description = "Solid-shell generation with linear flow matching and a three-branch physics surrogate."
+description = "Solid-shell generation with cosine VP diffusion, DDIM, and a three-branch physics surrogate."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }

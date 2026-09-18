@@ -9,7 +9,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="TFM shell research CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    architect = subparsers.add_parser("architect", help="Train the flow-matching Architect")
+    architect = subparsers.add_parser("architect", help="Train the VP diffusion Architect")
     architect.add_argument("--config", default="configs/architect.yaml")
 
     engineer = subparsers.add_parser("engineer", help="Train the engineer surrogate")
@@ -18,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     sample = subparsers.add_parser("sample", help="Run physics-guided sampling")
     sample.add_argument("--config", default="configs/sample_guided.yaml")
 
-    benchmark = subparsers.add_parser("benchmark", help="Compare ODE step counts using paired initial noise")
+    benchmark = subparsers.add_parser("benchmark", help="Compare deterministic DDIM step counts using paired initial noise")
     benchmark.add_argument("--config", default="configs/sample_guided.yaml")
     benchmark.add_argument("--steps", nargs="+", type=int, default=[10, 20, 50, 100, 250])
     benchmark.add_argument("--reference-steps", type=int, default=1000)

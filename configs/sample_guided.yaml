@@ -12,7 +12,9 @@ engineer:
 
 sampling:
   num_inference_steps: 50
-  solver: euler
+  solver: ddim
+  eta: 0.0
+  time_spacing: quadratic
   guidance_scale: 1.0
   grad_clip: 5.0
   guidance_schedule: bell
@@ -24,10 +26,10 @@ sampling:
 
 mlflow:
   tracking_uri: ./mlruns
-  experiment_name: flow_guided_sampling_solid
+  experiment_name: vp_ddim_guided_sampling_solid
   run_name_prefix: sample
   tags:
-    pipeline: flow_matching_pbunet
+    pipeline: vp_ddim_pbunet
     stage: thesis
 
 runtime:

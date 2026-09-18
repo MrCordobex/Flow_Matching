@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from copy import deepcopy
+from collections.abc import Callable
 
 from tfm_shells.utils.matplotlib_backend import configure_matplotlib_backend
 
@@ -17,7 +19,7 @@ from tqdm.auto import tqdm
 from tfm_shells.config import load_config, resolve_project_path
 from tfm_shells.data.dataset import ShellDataset, compute_normalization_stats
 from tfm_shells.data.index import build_dataset_index, dataset_summary, filter_records, split_records
-from tfm_shells.flow import integrate_flow, model_time, sample_flow_path
+from tfm_shells.vp_diffusion import CosineVPSchedule, sample_ddim, sample_vp_path, vp_model_time
 from tfm_shells.models.factory import build_unet, count_parameters
 from tfm_shells.training.common import (
     finalize_latest_symlink,
@@ -41,13 +43,15 @@ def _sample_images(
     width: int,
     device: torch.device,
     num_steps: int,
-    solver: str = "euler",
+    schedule: CosineVPSchedule,
+    spacing: str = "quadratic",
+    eta: float = 0.0,
 ) -> torch.Tensor:
     model.eval()
     samples = torch.randn((batch_size, 1, height, width), device=device)
     def field(state: torch.Tensor, t: float) -> torch.Tensor:
-        return model(state, model_time(t, state.shape[0], device)).sample
-    return integrate_flow(field, samples, num_steps, solver)
+        return model(state, vp_model_time(t, state.shape[0], device)).sample
+    return sample_ddim(field, samples, num_steps, schedule, spacing, eta)
 
 
 def _save_sample_grid(
@@ -69,7 +73,7 @@ def _save_sample_grid(
         if index < batch_size:
             axis.imshow(denorm[index, 0], cmap="viridis")
             axis.set_title(f"sample_{index}")
-    figure.suptitle("Flow Architect samples")
+    figure.suptitle("VP + DDIM Architect samples")
     figure.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=180, bbox_inches="tight")
@@ -79,6 +83,7 @@ def _save_sample_grid(
 def _run_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
+    schedule: CosineVPSchedule,
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
     mixed_precision: bool,
@@ -86,6 +91,7 @@ def _run_epoch(
     epoch: int,
     total_epochs: int,
     phase: str,
+    after_optimizer_step: Callable[[], None] | None = None,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -103,13 +109,13 @@ def _run_epoch(
         for batch in progress:
             z_clean = batch["z"].to(device, non_blocking=True)
             batch_size = z_clean.shape[0]
-            state, time, target = sample_flow_path(z_clean)
+            state, time, target = sample_vp_path(z_clean, schedule)
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type=autocast_device, dtype=autocast_dtype, enabled=use_amp):
-                prediction = model(state, model_time(time, batch_size, device)).sample
+                prediction = model(state, vp_model_time(time, batch_size, device)).sample
                 loss = F.mse_loss(prediction, target)
 
             if is_train:
@@ -118,6 +124,8 @@ def _run_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
+                if after_optimizer_step is not None:
+                    after_optimizer_step()
 
             total_loss += float(loss.item()) * batch_size
             total_items += batch_size
@@ -131,6 +139,9 @@ def train_architect(
     role: str = "architect",
 ) -> dict[str, Any]:
     config = load_config(config_path)
+    if config["model"].get("method") != "vp_diffusion_v":
+        raise ValueError("Architect model.method must be vp_diffusion_v")
+    vp_schedule = CosineVPSchedule(float(config["model"].get("cosine_s", 0.008)))
     seed_everything(int(config["seed"]))
     directories = prepare_run_directories(config, role=role)
     device = resolve_device(str(config["runtime"]["device"]))
@@ -143,7 +154,7 @@ def train_architect(
         min_mf_mean=config["data"].get("min_mf_mean"),
     )
     if config["data"]["subset"] != "solid":
-        raise ValueError("This flow-matching repository trains only solid shells.")
+        raise ValueError("This VP Architect trains only solid shells.")
     train_records, val_records = split_records(
         filtered, val_ratio=float(config["data"]["val_ratio"]), seed=int(config["seed"])
     )
@@ -181,9 +192,25 @@ def train_architect(
     model = build_unet(config["model"]).to(device)
     model_parameters = count_parameters(model)
     if config["model"].get("kind", "unet") != "unet":
-        raise ValueError("Flow Architect must use the one-branch UNet2DModel.")
+        raise ValueError("VP Architect must use the one-branch UNet2DModel.")
     if int(config["model"]["in_channels"]) != 1 or int(config["model"]["out_channels"]) != 1:
-        raise ValueError("Flow Architect requires one input and one output channel.")
+        raise ValueError("VP Architect requires one input and one output channel.")
+
+    ema_model = deepcopy(model).eval().requires_grad_(False)
+    ema_decay = float(config["training"].get("ema_decay", 0.999))
+    if not 0.0 <= ema_decay < 1.0:
+        raise ValueError("training.ema_decay must be in [0, 1)")
+    optimizer_steps = 0
+
+    @torch.no_grad()
+    def update_ema() -> None:
+        nonlocal optimizer_steps
+        optimizer_steps += 1
+        decay = min(ema_decay, (optimizer_steps + 1.0) / (optimizer_steps + 10.0))
+        for ema_param, online_param in zip(ema_model.parameters(), model.parameters()):
+            ema_param.lerp_(online_param, 1.0 - decay)
+        for ema_buffer, online_buffer in zip(ema_model.buffers(), model.buffers()):
+            ema_buffer.copy_(online_buffer)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -244,6 +271,7 @@ def train_architect(
             train_metrics = _run_epoch(
                 model=model,
                 loader=train_loader,
+                schedule=vp_schedule,
                 optimizer=optimizer,
                 device=device,
                 mixed_precision=bool(config["training"]["mixed_precision"]),
@@ -251,10 +279,12 @@ def train_architect(
                 epoch=epoch,
                 total_epochs=total_epochs,
                 phase="train",
+                after_optimizer_step=update_ema,
             )
             val_metrics = _run_epoch(
-                model=model,
+                model=ema_model,
                 loader=val_loader,
+                schedule=vp_schedule,
                 optimizer=None,
                 device=device,
                 mixed_precision=bool(config["training"]["mixed_precision"]),
@@ -278,10 +308,11 @@ def train_architect(
             checkpoint = {
                 "epoch": epoch,
                 "role": role,
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": ema_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "model_config": config["model"],
-                "flow_config": {"path": "linear", "time_scale": 999.0, "base": "standard_normal"},
+                "diffusion_config": {"method": "cosine_vp_v", "cosine_s": vp_schedule.s,
+                                     "time_scale": 999.0, "sampler": "ddim", "ema_decay": ema_decay},
                 "normalization_stats": stats,
                 "config_path": str(config["_meta"]["config_path"]),
                 "dataset_summary": splits["dataset_summary"],
@@ -315,13 +346,15 @@ def train_architect(
             sample_every = int(config["training"]["sample_every_n_epochs"])
             if epoch == 1 or epoch % sample_every == 0:
                 samples = _sample_images(
-                    model=model,
+                    model=ema_model,
                     batch_size=int(config["training"]["sample_batch_size"]),
                     height=int(config["model"]["sample_size"]),
                     width=int(config["model"]["sample_size"]),
                     device=device,
                     num_steps=int(config["training"]["sample_inference_steps"]),
-                    solver=str(config["training"].get("sample_solver", "euler")),
+                    schedule=vp_schedule,
+                    spacing=str(config["training"].get("sample_time_spacing", "quadratic")),
+                    eta=float(config["training"].get("sample_eta", 0.0)),
                 )
                 sample_path = directories["run_root"] / f"samples_epoch_{epoch:03d}.png"
                 _save_sample_grid(samples, stats, sample_path)

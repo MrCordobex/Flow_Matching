@@ -1,4 +1,4 @@
-"""Paired numerical convergence experiment for the flow sampler."""
+"""Paired numerical convergence experiment for deterministic VP DDIM."""
 
 from __future__ import annotations
 
@@ -23,7 +23,9 @@ def benchmark_steps(config_path: Path, steps: list[int], reference_steps: int, o
     batch_size = int(config["conditioning"]["batch_size"])
     size = int(context.architect.config.sample_size)
     initial = torch.randn((batch_size, 1, size, size), device=device)
-    solver = str(config["sampling"].get("solver", "euler"))
+    solver = str(config["sampling"].get("solver", "ddim"))
+    if solver != "ddim" or float(config["sampling"].get("eta", 0.0)) != 0.0:
+        raise ValueError("The paired DDIM step benchmark requires solver=ddim and eta=0")
     counts = sorted(set([reference_steps, *steps]))
     if any(count < 1 for count in counts):
         raise ValueError("All step counts must be positive")
@@ -54,7 +56,7 @@ def benchmark_steps(config_path: Path, steps: list[int], reference_steps: int, o
             "solver": solver,
             "guided": float(config["sampling"]["guidance_scale"]) > 0,
             "seconds": elapsed,
-            "model_evaluations": count * (2 if solver == "heun" else 1),
+            "model_evaluations": count,
             "mf_mean": float(mf.mean()),
             "mf_std": float(mf.std()),
             "p_mf_gt_090": float((mf > 0.90).mean()),
@@ -69,7 +71,9 @@ def benchmark_steps(config_path: Path, steps: list[int], reference_steps: int, o
         writer.writeheader()
         writer.writerows(rows)
     save_json(
-        {"reference_steps": reference_steps, "solver": solver, "seed": int(config["seed"]),
+        {"reference_steps": reference_steps, "solver": solver, "eta": 0.0,
+         "time_spacing": str(config["sampling"].get("time_spacing", "quadratic")),
+         "seed": int(config["seed"]),
          "batch_size": batch_size, "guidance_scale": float(config["sampling"]["guidance_scale"]),
          "comparison": "same initial Gaussian noise, same trained checkpoints, same solver and load"},
         output_path / "metadata.json",

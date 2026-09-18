@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
+import yaml
 
 from tfm_shells.flow import integrate_flow, model_time
 from tfm_shells.models.factory import build_unet
-from tfm_shells.sampling.guided import SamplingContext, generate_samples
+from tfm_shells.sampling.guided import SamplingContext, _check_vp_checkpoint, generate_samples
 from tfm_shells.training.train_architect import _run_epoch as run_architect_epoch
 from tfm_shells.training.train_engineer import _run_epoch
+from tfm_shells.vp_diffusion import CosineVPSchedule, ddim_step, sample_ddim, sample_vp_path, vp_model_time
 from tfm_shells.utils.physics import (
     balanced_supervised_loss,
     branchwise_supervised_losses,
@@ -18,6 +21,61 @@ from tfm_shells.utils.physics import (
 
 
 class FlowMatchingTests(unittest.TestCase):
+    def test_architect_engineer_configs_and_checkpoint_methods_match(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with (root / "configs" / "architect.yaml").open(encoding="utf-8") as handle:
+            architect = yaml.safe_load(handle)
+        with (root / "configs" / "engineer.yaml").open(encoding="utf-8") as handle:
+            engineer = yaml.safe_load(handle)
+        with (root / "configs" / "sample_guided.yaml").open(encoding="utf-8") as handle:
+            sampling = yaml.safe_load(handle)
+        self.assertEqual(float(architect["model"]["cosine_s"]), float(engineer["model"]["cosine_s"]))
+        self.assertEqual(sampling["sampling"]["solver"], "ddim")
+        self.assertEqual(float(sampling["sampling"]["eta"]), 0.0)
+        self.assertEqual(
+            _check_vp_checkpoint({"diffusion_config": {"method": "cosine_vp_v", "time_scale": 999.0, "cosine_s": 0.008}},
+                                 "Architect", "cosine_vp_v")["method"],
+            "cosine_vp_v",
+        )
+        with self.assertRaisesRegex(ValueError, "retrain older flow checkpoints"):
+            _check_vp_checkpoint({"flow_config": {"path": "linear", "time_scale": 999.0}},
+                                 "Architect", "cosine_vp_v")
+
+    def test_cosine_vp_path_and_ddim_recover_clean_image(self) -> None:
+        schedule = CosineVPSchedule(0.008)
+        clean = torch.full((2, 1, 4, 4), 0.7)
+        noise = torch.randn_like(clean)
+        alpha, sigma = schedule.alpha_sigma(torch.tensor(1.0))
+        self.assertEqual(float(alpha), 0.0)
+        self.assertAlmostEqual(float(alpha.square() + sigma.square()), 1.0, places=6)
+        initial = sigma * noise
+        def oracle(state: torch.Tensor, t: float) -> torch.Tensor:
+            a, s = schedule.alpha_sigma(torch.tensor(t))
+            return a * noise - s * clean
+        for spacing in ("uniform", "quadratic"):
+            sampled = sample_ddim(oracle, initial, 7, schedule, spacing=spacing, eta=0.0)
+            self.assertTrue(torch.allclose(sampled, clean, atol=2e-6))
+
+    def test_stochastic_ddim_step_uses_supplied_noise(self) -> None:
+        schedule = CosineVPSchedule()
+        state = torch.zeros(1, 1, 2, 2)
+        velocity = torch.ones_like(state)
+        noise = torch.ones_like(state)
+        deterministic = ddim_step(state, velocity, 0.8, 0.4, schedule, eta=0.0)
+        stochastic = ddim_step(state, velocity, 0.8, 0.4, schedule, eta=1.0, noise=noise)
+        self.assertTrue(torch.isfinite(stochastic).all())
+        self.assertFalse(torch.allclose(deterministic, stochastic))
+
+    def test_architect_and_engineer_share_vp_path(self) -> None:
+        schedule = CosineVPSchedule(0.008)
+        clean = torch.randn(8, 1, 4, 4)
+        state, time, target = sample_vp_path(clean, schedule)
+        alpha, sigma = schedule.alpha_sigma(time)
+        a, s = alpha[:, None, None, None], sigma[:, None, None, None]
+        noise = (state - a * clean) / s
+        self.assertTrue(torch.allclose(target, a * noise - s * clean, atol=1e-5))
+        self.assertEqual(float(vp_model_time(1.0, 1, torch.device("cpu"))[0]), 999.0)
+
     def test_balanced_supervision_weights_each_branch_equally(self) -> None:
         pred = torch.zeros(1, 13, 2, 2)
         pred[:, 0] = 1.0
@@ -92,7 +150,7 @@ class FlowMatchingTests(unittest.TestCase):
         self.assertGreater(float(result.mean()), 0.0)
         self.assertEqual(len(history["t"]), 4)
 
-    def test_pbunet_training_interface_uses_flow_states(self) -> None:
+    def test_pbunet_training_interface_uses_vp_states(self) -> None:
         class TinyThreeBranch(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -101,6 +159,9 @@ class FlowMatchingTests(unittest.TestCase):
                 self.f = torch.nn.Conv2d(2, 6, 1)
 
             def forward(self, x, t):
+                if not hasattr(self, "calls"):
+                    self.calls = []
+                self.calls.append((x.detach().clone(), t.detach().clone()))
                 self.last_time = t.detach().clone()
                 return type("Output", (), {"sample": torch.cat([self.u(x), self.m(x), self.f(x)], dim=1)})()
 
@@ -120,13 +181,14 @@ class FlowMatchingTests(unittest.TestCase):
                                "constitutive": {"enabled": True, "young_modulus": 1.0,
                                                 "poisson_ratio": 0.2, "thickness": 1.0,
                                                 "lambda_max": 0.05, "warmup_epochs": 0}}}
-        result = _run_epoch(model, [batch], optimizer, stats, config, torch.device("cpu"),
+        result = _run_epoch(model, [batch], CosineVPSchedule(), optimizer, stats, config, torch.device("cpu"),
                             lambda_epoch=0.0, include_fz_channel=True,
                             include_type_channel=False, epoch=1, total_epochs=20, phase="test")
         self.assertGreaterEqual(result["mse"], 0.0)
         self.assertGreaterEqual(result["constitutive"], 0.0)
         self.assertEqual(tuple(model.last_time.shape), (2,))
-        self.assertTrue(torch.all(model.last_time == 999))
+        self.assertTrue(torch.all(model.last_time == 0))
+        self.assertTrue(torch.all(model.calls[0][1] >= 0) and torch.all(model.calls[0][1] <= 999))
 
     def test_architect_training_interface_uses_velocity_target(self) -> None:
         class TinyArchitect(torch.nn.Module):
@@ -140,7 +202,7 @@ class FlowMatchingTests(unittest.TestCase):
 
         model = TinyArchitect()
         result = run_architect_epoch(
-            model, [{"z": torch.zeros(2, 1, 4, 4)}],
+            model, [{"z": torch.zeros(2, 1, 4, 4)}], CosineVPSchedule(),
             torch.optim.Adam(model.parameters(), lr=1e-3),
             torch.device("cpu"), False, 1.0, 1, 1, "test",
         )
