@@ -51,3 +51,92 @@ Esto genera `artifacts/step_benchmark/step_benchmark.csv` y `metadata.json`. El 
 ## Alcance
 
 Esta copia no incluye el dataset ni los pesos entrenados. No hay resultados de convergencia nuevos hasta entrenar y ejecutar el benchmark. Los scripts de análisis históricos de `TFM` no son necesarios para lanzar este pipeline de sólidos.
+
+## Evaluar el MF de las muestras con Kratos
+
+Desde la raíz del repositorio, después del sampling:
+
+```bash
+uv run evaluate_kratos.py artifacts/sample/NOMBRE_DEL_RUN
+# También acepta solo NOMBRE_DEL_RUN o la ruta directa al NPZ.
+# Prueba de dos muestras:
+uv run evaluate_kratos.py artifacts/sample/NOMBRE_DEL_RUN --limit 2
+```
+
+El script declara sus dependencias: `uv` prepara un entorno independiente con
+Python 3.12, Kratos 10.4.3 y Plotly. No requiere torch, checkpoints ni la carpeta
+local `Code/Prueba Kratos`. La primera ejecución necesita descargar dependencias.
+Usar `uv run evaluate_kratos.py`, sin intercalar `python`, para activar esta instalación.
+
+Lee `guided_samples.npz`, clave `z`, en metros, sin renormalizar, suavizar ni
+desplazar la geometría. Admite `(B,1,H,W)`, `(B,H,W)` y `(H,W)`.
+Cada píxel es un nodo; se utilizan cuadriláteros entre píxeles vecinos.
+Solo sirve para láminas sólidas: no interpreta huecos a partir de ceros.
+
+**Hipótesis físicas registradas en cada evaluación:** planta 10×10 m,
+espesor 0,10 m, E=30 GPa, nu=0,20, densidad 2500 kg/m³ y gravedad 9,81 m/s².
+Se aplica peso propio sobre el área real inicial de cada elemento, repartido
+entre sus cuatro nodos. No se reutiliza el mapa `fz` del Engineer.
+Se empotran las seis componentes de los nodos con **z <= 0,10 * max(z)**,
+incluidos nodos interiores. El umbral se mide respecto a z=0, sin restar min(z).
+El elemento `ShellThinElementCorotational3D4N` y Newton–Raphson siguen el
+análisis geométricamente no lineal de `Prueba Kratos/generate_funicular_dataset.py`.
+Esto es una evaluación FEM bajo estas hipótesis, no una reproducción idéntica
+del S4R lineal de Abaqus ni una solución analítica exacta.
+
+Las propiedades se pueden cambiar mediante `--span-x`, `--span-y`, `--thickness`,
+`--young-modulus`, `--poisson-ratio`, `--density`, `--gravity` y `--support-fraction`.
+El script comprueba convergencia, valores finitos y equilibrio de reacciones.
+Las muestras que fallan se registran como `failed`, se excluyen de las medias y
+el comando devuelve un código de error, conservando los resultados correctos.
+
+### Qué significa cada MF
+
+| Campo | Definición |
+|---|---|
+| `mf_mean` (principal) | Método de `Prueba Kratos`: cociente de energías nativas de membrana y flexión por elemento; promedio de elementos adyacentes a cada nodo y media de todos los nodos, incluidos apoyos. |
+| `mf_energy_ratio` | Suma de las medidas nativas de energía de membrana dividida entre suma de membrana y flexión. No es una media espacial de MF. |
+| `mf_resultants_area_mean` | Fórmula de `Dataset_Kratos`: energías reconstruidas a partir de N y M medios en los puntos de integración, promedio por área y exclusión de elementos con cuatro nodos empotrados. |
+
+Para reproducir el primer método, se suman los valores no negativos que Kratos
+devuelve para `SHELL_ELEMENT_MEMBRANE_ENERGY` y `SHELL_ELEMENT_BENDING_ENERGY`.
+MF local = Em / max(Em + Eb, 1e-30). Se guarda el mapa nodal como `mf`.
+No se mezclan las tres métricas ni se presentan como intercambiables.
+El criterio de apoyos y el método de agregación también deben coincidir cuando
+se compare con el MF estimado por el Engineer.
+
+### Salidas y Jupyter/Colab
+
+La subcarpeta `kratos/` del run contiene:
+
+- `metrics.csv`, `summary.json` y `evaluation.json` con configuración y huella de entrada.
+- `samples/sample_XXXX.npz`: geometría, apoyos, desplazamientos, reacciones,
+  fuerzas nodales, áreas, N, M, energías y mapas de MF; JSON individual con métricas.
+- `mf_gallery.html`: visor 3D autónomo, sin conexión, con selector de muestra,
+  geometría coloreada por MF y apoyos negros; permite girar, ampliar y consultar valores.
+- `mf_gallery.plotly.json` y `view_mf.ipynb`, para visualizar el resultado en Jupyter.
+
+En el notebook donde ya has ejecutado el sampling:
+
+```python
+SAMPLING_DIR = '/content/Flow_Matching/artifacts/sample/NOMBRE_DEL_RUN'
+!uv run evaluate_kratos.py "{SAMPLING_DIR}"
+```
+
+Después, para ver la figura dentro de una celda sin instalar Kratos en el kernel:
+
+```python
+from pathlib import Path
+import html
+from IPython.display import HTML, display
+
+document = (Path(SAMPLING_DIR) / 'kratos' / 'mf_gallery.html').read_text(encoding='utf-8')
+display(HTML('<iframe style="width:100%;height:780px;border:0" srcdoc="'
+             + html.escape(document, quote=True) + '"></iframe>'))
+```
+
+También puedes abrir `kratos/view_mf.ipynb` junto a su HTML; si lo mueves,
+ajusta `OUTPUT` en su celda. Volver a ejecutar el mismo comando reanuda los
+casos pendientes; `--overwrite` recalcula los seleccionados. Para otra
+configuración, entrada o versión del evaluador usa `--output-dir` distinto,
+evitando mezclar resultados. `--start` y `--limit` permiten evaluar por bloques.
