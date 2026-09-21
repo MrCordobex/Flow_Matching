@@ -36,6 +36,27 @@ La CLI equivalente es `uv run tfm-shells architect|engineer|sample --config ...`
 
 El muestreo por defecto usa 50 pasos DDIM, `eta=0`, malla `quadratic` y `γ=1`; son valores iniciales para probar, **no resultados calibrados**. Cambia `sampling.num_inference_steps`, `sampling.time_spacing` (`uniform` o `quadratic`), `sampling.eta` y `sampling.guidance_scale` en el YAML. DDIM hace una evaluación del Architect por paso y, con guiado, una del Engineer.
 
+### Comparar DDIM con DDPM ancestral sin volver a entrenar
+
+En `configs/sample_guided.yaml`, pon `guidance_scale: 0.0` y cambia únicamente
+`solver: ddim` por `solver: ddpm` entre dos ejecuciones de
+`uv run python sample_guided.py --config configs/sample_guided.yaml`.
+Mantén iguales `seed`, `num_inference_steps`, `time_spacing`, checkpoints y
+`clip_denoised`. Con `ddpm`, la varianza posterior VP se activa en cada paso
+(equivale a `eta=1` en el calendario coseno continuo); el valor `eta` del YAML
+se aplica solo a `ddim`. La misma semilla garantiza el mismo ruido inicial;
+DDPM consume además ruido adicional en cada paso. Los runs quedan en carpetas
+separadas, con `solver`, `eta` efectivo y `clip_denoised` en `summary.json`.
+
+Para investigar los picos como en el experimento anterior, usa también
+`clip_denoised: true` en **ambos** runs. Esta opción recorta la estimación de
+`x₀` en coordenadas normalizadas a `[-1,1]` en cada paso. Haz una comparación
+separada con `clip_denoised: false`, el comportamiento previo de este repo.
+El DDPM ancestral de aquí usa exactamente el calendario VP continuo entrenado
+en este Architect; el TFM original usaba el `DDPMScheduler` discreto de
+Diffusers, por lo que sus muestras no tienen por qué coincidir píxel a píxel.
+El benchmark `benchmark_steps.py` sigue reservado para DDIM determinista.
+
 Las comprobaciones locales se ejecutan con `uv run python -m unittest discover -s tests -v`. La arquitectura y los pesos de las pérdidas son hipótesis para probar. Compara `val_uz_mse`, `val_membrane_mse`, `val_flexion_mse`, `val_mf_mae` y la evaluación FEM externa con la PBUNet anterior antes de concluir que mejora la predicción. La consistencia constitutiva sí se comprobó sobre campos FEM; la pérdida global de energía no equivale a imponer todo el equilibrio de la lámina.
 
 ## Comprobar la convergencia en menos pasos

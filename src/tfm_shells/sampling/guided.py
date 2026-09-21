@@ -16,7 +16,7 @@ import torch
 from tqdm.auto import tqdm
 
 from tfm_shells.config import load_config, resolve_project_path, save_config
-from tfm_shells.vp_diffusion import CosineVPSchedule, sample_ddim, vp_model_time
+from tfm_shells.vp_diffusion import CosineVPSchedule, sample_ddim, sample_ddpm, vp_model_time
 from tfm_shells.models.factory import build_unet
 from tfm_shells.training.common import (
     bell_guidance_weight,
@@ -127,12 +127,13 @@ def generate_samples(
 ) -> tuple[torch.Tensor, dict[str, list[float]]]:
     if initial.ndim != 4 or initial.shape[1] != 1:
         raise ValueError("initial noise must have shape (B, 1, H, W)")
-    if solver != "ddim":
-        raise ValueError("VP sampling requires solver='ddim'")
+    if solver not in {"ddim", "ddpm"}:
+        raise ValueError("VP sampling requires solver='ddim' or solver='ddpm'")
     scale = float(config["sampling"]["guidance_scale"])
     clip = float(config["sampling"]["grad_clip"])
     eta = float(config["sampling"].get("eta", 0.0))
     spacing = str(config["sampling"].get("time_spacing", "quadratic"))
+    clip_denoised = bool(config["sampling"].get("clip_denoised", False))
     if clip <= 0 or scale < 0:
         raise ValueError("grad_clip must be positive and guidance_scale nonnegative")
     history: dict[str, list[float]] = {"t": [], "objective": [], "mf_mean": [], "grad_norm": [], "guide_weight": []}
@@ -160,7 +161,7 @@ def generate_samples(
         _, sigma = context.vp_schedule.alpha_sigma(torch.as_tensor(t, device=state.device))
         return velocity + sigma * correction.detach()
 
-    progress = tqdm(total=steps, desc="VP DDIM sampling", disable=not show_progress)
+    progress = tqdm(total=steps, desc=f"VP {solver.upper()} sampling", disable=not show_progress)
 
     def record(index: int, t: float, state: torch.Tensor) -> None:
         history["t"].append(t)
@@ -169,8 +170,14 @@ def generate_samples(
         progress.update(1)
 
     try:
-        result = sample_ddim(velocity_field, initial, steps, context.vp_schedule,
-                             spacing=spacing, eta=eta, step_callback=record)
+        if solver == "ddpm":
+            result = sample_ddpm(velocity_field, initial, steps, context.vp_schedule,
+                                 spacing=spacing, step_callback=record,
+                                 clip_denoised=clip_denoised)
+        else:
+            result = sample_ddim(velocity_field, initial, steps, context.vp_schedule,
+                                 spacing=spacing, eta=eta, step_callback=record,
+                                 clip_denoised=clip_denoised)
     finally:
         progress.close()
     return result, history
@@ -222,9 +229,10 @@ def run_guided_sampling(config_path: str | Path) -> dict[str, Any]:
     plt.close(figure)
 
     summary = {
-        "method": "cosine_vp_v_ddim",
+        "method": f"cosine_vp_v_{solver}",
         "solver": solver,
-        "eta": float(config["sampling"].get("eta", 0.0)),
+        "eta": 1.0 if solver == "ddpm" else float(config["sampling"].get("eta", 0.0)),
+        "clip_denoised": bool(config["sampling"].get("clip_denoised", False)),
         "time_spacing": str(config["sampling"].get("time_spacing", "quadratic")),
         "num_inference_steps": steps,
         "guidance_scale": float(config["sampling"]["guidance_scale"]),

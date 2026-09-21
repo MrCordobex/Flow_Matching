@@ -1,4 +1,4 @@
-"""Continuous cosine VP diffusion with v prediction and DDIM sampling.
+"""Continuous cosine VP diffusion with v prediction and DDIM/DDPM sampling.
 
 Time 0 denotes a clean shell; time 1 denotes standard Gaussian noise.
 The v target equals the derivative of the VP path with respect to its angle.
@@ -66,6 +66,7 @@ def ddim_step(
     schedule: CosineVPSchedule,
     eta: float = 0.0,
     noise: torch.Tensor | None = None,
+    clip_denoised: bool = False,
 ) -> torch.Tensor:
     if not 0.0 <= eta <= 1.0:
         raise ValueError("eta must be in [0, 1]")
@@ -75,9 +76,14 @@ def ddim_step(
         raise ValueError("DDIM requires 0 <= next_t < t")
     alpha_t, sigma_t = schedule.alpha_sigma(t_value)
     clean_hat = alpha_t * state - sigma_t * velocity
+    if clip_denoised:
+        clean_hat = clean_hat.clamp(-1.0, 1.0)
     if bool(next_value == 0):
         return clean_hat
-    noise_hat = sigma_t * state + alpha_t * velocity
+    # After clipping x0, recompute epsilon so x_t = alpha_t*x0 + sigma_t*epsilon
+    # remains true. With no clipping this equals sigma_t*state + alpha_t*velocity.
+    noise_hat = ((state - alpha_t * clean_hat) / sigma_t
+                 if clip_denoised else sigma_t * state + alpha_t * velocity)
     alpha_next, sigma_next = schedule.alpha_sigma(next_value)
     stochastic = eta * (sigma_next / sigma_t) * torch.sqrt(
         (1.0 - (alpha_t / alpha_next).square()).clamp_min(0.0)
@@ -98,6 +104,7 @@ def sample_ddim(
     spacing: str = "quadratic",
     eta: float = 0.0,
     step_callback: Callable[[int, float, torch.Tensor], None] | None = None,
+    clip_denoised: bool = False,
 ) -> torch.Tensor:
     if not 0.0 <= eta <= 1.0:
         raise ValueError("eta must be in [0, 1]")
@@ -107,7 +114,27 @@ def sample_ddim(
         current = float(grid[index])
         next_time = float(grid[index + 1])
         velocity = field(state, current)
-        state = ddim_step(state, velocity, current, next_time, schedule, eta)
+        state = ddim_step(state, velocity, current, next_time, schedule, eta,
+                          clip_denoised=clip_denoised)
         if step_callback is not None:
             step_callback(index, next_time, state)
     return state
+
+
+@torch.no_grad()
+def sample_ddpm(
+    field: Callable[[torch.Tensor, float], torch.Tensor],
+    initial: torch.Tensor,
+    steps: int,
+    schedule: CosineVPSchedule,
+    spacing: str = "quadratic",
+    step_callback: Callable[[int, float, torch.Tensor], None] | None = None,
+    clip_denoised: bool = False,
+) -> torch.Tensor:
+    """Ancestral VP posterior on the selected grid (DDIM eta=1).
+
+    This shares the exact cosine path and v network with deterministic DDIM.
+    It is not the discrete DDPMScheduler used by the earlier TFM checkpoint.
+    """
+    return sample_ddim(field, initial, steps, schedule, spacing=spacing, eta=1.0,
+                       step_callback=step_callback, clip_denoised=clip_denoised)

@@ -12,7 +12,7 @@ from tfm_shells.models.factory import build_unet
 from tfm_shells.sampling.guided import SamplingContext, _check_vp_checkpoint, generate_samples
 from tfm_shells.training.train_architect import _run_epoch as run_architect_epoch
 from tfm_shells.training.train_engineer import _run_epoch
-from tfm_shells.vp_diffusion import CosineVPSchedule, ddim_step, sample_ddim, sample_vp_path, vp_model_time
+from tfm_shells.vp_diffusion import CosineVPSchedule, ddim_step, sample_ddim, sample_ddpm, sample_vp_path, vp_model_time
 from tfm_shells.utils.physics import (
     balanced_gradient_loss,
     balanced_supervised_loss,
@@ -66,6 +66,53 @@ class FlowMatchingTests(unittest.TestCase):
         stochastic = ddim_step(state, velocity, 0.8, 0.4, schedule, eta=1.0, noise=noise)
         self.assertTrue(torch.isfinite(stochastic).all())
         self.assertFalse(torch.allclose(deterministic, stochastic))
+
+    def test_ddpm_step_matches_vp_posterior_mean_and_variance(self) -> None:
+        schedule = CosineVPSchedule()
+        state = torch.tensor([[[[0.4, -0.2]]]], dtype=torch.float64)
+        velocity = torch.tensor([[[[-0.5, 0.3]]]], dtype=torch.float64)
+        noise = torch.tensor([[[[0.7, -1.2]]]], dtype=torch.float64)
+        t, next_t = 0.8, 0.55
+        alpha_t, sigma_t = schedule.alpha_sigma(torch.tensor(t, dtype=state.dtype))
+        alpha_s, sigma_s = schedule.alpha_sigma(torch.tensor(next_t, dtype=state.dtype))
+        x0 = alpha_t * state - sigma_t * velocity
+        beta = 1 - (alpha_t / alpha_s).square()
+        variance = beta * sigma_s.square() / sigma_t.square()
+        mean = ((alpha_s * beta / sigma_t.square()) * x0
+                + (alpha_t * sigma_s.square() / (alpha_s * sigma_t.square())) * state)
+        sampled = ddim_step(state, velocity, t, next_t, schedule, eta=1.0, noise=noise)
+        self.assertTrue(torch.allclose(sampled, mean + variance.sqrt() * noise, atol=1e-12))
+
+    def test_ddpm_seed_and_x0_clipping_are_configurable(self) -> None:
+        schedule = CosineVPSchedule()
+        initial = torch.randn(2, 1, 4, 4)
+        field = lambda x, t: torch.zeros_like(x)
+        torch.manual_seed(13)
+        a = sample_ddpm(field, initial.clone(), 4, schedule, clip_denoised=True)
+        torch.manual_seed(13)
+        b = sample_ddpm(field, initial.clone(), 4, schedule, clip_denoised=True)
+        self.assertTrue(torch.equal(a, b))
+        self.assertTrue(torch.all(a.abs() <= 1))
+        unclipped = sample_ddim(field, initial.clone(), 4, schedule, eta=0.0)
+        self.assertFalse(torch.allclose(a, unclipped))
+
+    def test_sampler_selection_works_with_guidance_disabled(self) -> None:
+        class ZeroArchitect:
+            def __call__(self, x, t):
+                return type("Output", (), {"sample": torch.zeros_like(x)})()
+
+        context = SamplingContext(
+            architect=ZeroArchitect(), engineer=None, architect_stats={}, engineer_stats={},
+            fz_condition=torch.zeros(1, 1, 4, 4), device=torch.device("cpu"), source_file=None,
+        )
+        config = {"sampling": {"guidance_scale": 0.0, "grad_clip": 5.0,
+                               "eta": 0.0, "time_spacing": "uniform"}}
+        initial = torch.randn(1, 1, 4, 4)
+        deterministic, _ = generate_samples(context, config, initial.clone(), 4, "ddim")
+        torch.manual_seed(19)
+        ancestral, _ = generate_samples(context, config, initial.clone(), 4, "ddpm")
+        self.assertTrue(torch.isfinite(ancestral).all())
+        self.assertFalse(torch.allclose(deterministic, ancestral))
 
     def test_architect_and_engineer_share_vp_path(self) -> None:
         schedule = CosineVPSchedule(0.008)

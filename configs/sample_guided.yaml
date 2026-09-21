@@ -13,7 +13,8 @@ engineer:
 sampling:
   num_inference_steps: 50
   solver: ddim
-  eta: 0.0
+  eta: 0.0  # Sólo DDIM. solver: ddpm usa internamente eta=1.0.
+  clip_denoised: false  # true: recorta la geometría limpia normalizada a [-1, 1].
   time_spacing: quadratic
   guidance_scale: 1.0
   grad_clip: 5.0
