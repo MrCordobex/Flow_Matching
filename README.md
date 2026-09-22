@@ -1,19 +1,89 @@
-# Difusión VP + DDIM para láminas sólidas
+# Flow matching coseno para láminas sólidas
 
-Esta carpeta replica el pipeline principal de `TFM` para láminas **solid** de 64 × 64. El Engineer predeterminado es `hybrid_fourier_unet`: un tronco compartido con convoluciones locales, mezclado espectral y tres cabezas para los 13 campos físicos. Architect e Engineer usan el mismo proceso de difusión VP coseno del script `../Code/Prueba/diffusion_exotic.py`. El Architect predice `v` y genera con DDIM.
+Esta carpeta replica el pipeline principal de `TFM` para láminas **solid** de 64 × 64. El Engineer predeterminado es `hybrid_fourier_unet`: un tronco compartido con convoluciones locales, mezclado espectral y tres cabezas para los 13 campos físicos. Architect e Engineer comparten la trayectoria coseno del script `../Code/Prueba/diffusion_exotic.py`. El Architect por defecto está formulado como **flow matching**: regresa la velocidad `dx/dt` de esa trayectoria y genera integrando la ODE.
+
+## Architect: flow matching sobre la trayectoria coseno
+
+La trayectoria es la misma de siempre, `x_t = α z + σ ε` con `α=cos φ`, `σ=sin φ`
+y `φ(t)=(t+s)/(1+s)·π/2`. Flow matching regresa su derivada respecto al **tiempo**:
+
+```
+u(x_t, t) = dx_t/dt = k · (α ε − σ z),   k = dφ/dt = π / (2(1+s))
+```
+
+El paréntesis es exactamente el objetivo `v` anterior, porque `dφ/dt` es constante
+en esta trayectoria. **Sobre el camino coseno, la velocidad de flow matching y la
+predicción `v` son la misma función multiplicada por `k`** (con `s=0.008`,
+`k=1.5583`). Dos consecuencias prácticas:
+
+- El Engineer no se toca. Los estados `x_t`, el reparto estratificado de `t` y el
+  embedding `999t` son idénticos; un test comprueba que `sample_cosine_flow_path`
+  y `sample_vp_path` devuelven los mismos tensores con la misma semilla.
+- Un checkpoint `cosine_vp_v` antiguo se puede leer como campo de flujo dividiendo
+  por `k`. `load_sampling_context` lo hace solo, así que **los solvers nuevos se
+  pueden probar sobre el checkpoint ya entrenado, sin reentrenar**.
+
+Lo que sí cambia de verdad es el **muestreo**. `model.method` acepta:
+
+| `method` | Objetivo | Muestreo |
+|---|---|---|
+| `cosine_flow_u` (por defecto) | `dx/dt` | integradores ODE |
+| `vp_diffusion_v` | `dx/dφ` | DDIM / DDPM |
+
+La pérdida de flow matching vale `k²` veces la pérdida `v` para predictores
+equivalentes, así que el historial registra también `train_loss_v_units` y
+`val_loss_v_units`, comparables con las curvas de los runs anteriores.
+
+### Solvers disponibles
+
+`sampling.solver` en `configs/sample_guided.yaml`:
+
+| Solver | Evaluaciones por paso | Qué resuelve |
+|---|---|---|
+| `ddim` / `exponential` | 1 | Integrador exponencial: exacto si `(ẑ₀, ε̂)` fueran constantes en el paso. Son la misma operación. |
+| `euler` | 1 | ODE genérica, orden 1 |
+| `midpoint`, `heun` | 2 | ODE genérica, orden 2 |
+| `rk4` | 4 | ODE genérica, orden 4 |
+| `ddpm` | 1 | Posterior ancestral VP, estocástico |
+
+Los tests miden el orden empírico de convergencia contra un campo oráculo y
+obtienen 1.00, 1.98, 1.98 y 3.98; el integrador exponencial queda en precisión de
+máquina. DDIM y los Runge–Kutta **no resuelven lo mismo**: DDIM supone `ẑ₀`
+constante en el paso, los RK integran la ODE real. Convergen entre sí cuando
+suben los pasos, y difieren con pocos pasos. Comparar a igualdad de
+`architect_evaluations`, no de `num_inference_steps`: `heun` a 25 pasos cuesta lo
+mismo que `ddim` a 50.
+
+### El offset `s` deja ruido residual en `t=0`
+
+Con `s=0.008` la trayectoria **no llega a la geometría limpia** en `t=0`: llega a
+`α(0)·z + σ(0)·ε` con `σ(0)=0.01247`. Un solver ODE fiel reproduce ese término, que
+son ~4,9 cm de ruido blanco por píxel con la escala `z` del dataset, y ese ruido cae
+entero sobre la curvatura. DDIM lo esconde porque su último paso salta a `ẑ₀`.
+
+Por eso `integrate_cosine_flow` lleva `final_denoise=True`: en el último intervalo
+devuelve la estimación limpia en vez del estado integrado, igual que DDIM. **No lo
+pongas a `False` salvo para medir el efecto**; sin él, cambiar a un solver ODE
+empeora los picos en lugar de mejorarlos. Hay un test que fija las dos ramas.
+
+`clip_denoised` tampoco se comporta igual: con `ddim` acota la salida a `[-1,1]`
+de forma exacta, mientras que con los RK proyecta `ẑ₀` en cada etapa pero el estado
+integrado puede salirse ligeramente del rango.
 
 ## Método
 
 - Se normaliza `z` a `[-1,1]` con estadísticas del train y se toma `ε ~ N(0,I)`.
-- El calendario coseno continuo define `φ(t)=(t+s)/(1+s)·π/2`, `α=cos φ` y `σ=sin φ`; `x_t=α z+σ ε` y el objetivo del Architect es `v=α ε−σ z`. `t=0` representa geometría casi limpia y `t=1` ruido puro. El tiempo se muestrea de forma estratificada por lote.
-- Se conserva la arquitectura `UNet2DModel` original de un canal. Su embedding temporal recibe `999t`. El muestreo DDIM recorre `t=1→0`, con `eta=0` por defecto, malla cuadrática y pesos EMA del Architect.
+- El calendario coseno continuo define `φ(t)=(t+s)/(1+s)·π/2`, `α=cos φ` y `σ=sin φ`; `x_t=α z+σ ε` y el objetivo del Architect es la velocidad de flow matching `u=k(α ε−σ z)`. `t=0` representa geometría casi limpia y `t=1` ruido puro. El tiempo se muestrea de forma estratificada por lote.
+- Se conserva la arquitectura `UNet2DModel` original de un canal. Su embedding temporal recibe `999t`. La integración recorre `t=1→0` con malla cuadrática y pesos EMA del Architect; el solver se elige en el YAML.
 - El Engineer aprende **sobre los mismos estados VP y el mismo calendario** que el Architect: recibe `(x_t, fz)` y `999t`, y predice `uz`, seis campos de membrana y seis de flexión. Su tronco U-Net comparte información entre las ramas: los bloques de Fourier mezclan información global a resoluciones 32 × 32 y 16 × 16, mientras las convoluciones 3 × 3 y las conexiones entre escalas conservan detalles locales. Se añaden coordenadas normalizadas y un embedding temporal continuo. El FFT usa un halo replicado para reducir la discontinuidad periódica de los bordes. Esta combinación está inspirada en [FNO](https://arxiv.org/abs/2010.08895) y [U-FNO](https://arxiv.org/abs/2109.03697); no supone que sus resultados en otros PDE se reproduzcan en estas láminas.
 - La pérdida supervisada da un tercio del peso a cada rama: `MSE_uz/3 + MSE_membrana/3 + MSE_flexión/3`, con canales normalizados usando solo el conjunto de entrenamiento. Una pérdida de diferencias espaciales, igualmente equilibrada por ramas, supervisa la estructura local. Ambas pérdidas se calculan contra los campos FEM. El residuo físico global recibe peso `(1−t)^p`, porque la geometría limpia está en `t=0`.
 - La pérdida constitutiva opcional, activada en `configs/engineer.yaml`, compara los esfuerzos de membrana con `A ε` y los momentos con `D κ` para material elástico isótropo. Sus residuos se dividen por la desviación típica de cada salida FEM antes de elevar al cuadrado; membrana y flexión reciben igual peso. `E=30 GPa`, `ν=0,2` y `h=0,1 m` coinciden con los datos sólidos revisados. Las componentes `12` llevan el factor `1/2` de la convención del dataset. Ajusta estos parámetros si cambias de material, espesor o convención FEM.
 - La evaluación del Engineer sobre la geometría limpia usa `t=0` tanto para la figura como para `mf_mae`.
 - El guiado evalúa directamente el Engineer en el mismo estado VP del Architect. Modifica la predicción `v` con `+σ(t)·clip(γ w(1−t)∇(1−MF)^2, ±grad_clip)` antes del paso DDIM; el signo produce descenso del objetivo en la estimación de la muestra limpia. `γ` debe ajustarse experimentalmente.
 
-El Architect no usa `fz` como entrada. La carga actúa en el Engineer y en el guiado, igual que en el pipeline original sin condición tipológica. Ambos checkpoints deben indicar el mismo `cosine_s`; los antiguos checkpoints de Flow Matching lineal y DDPM se rechazan. Hay que entrenar el nuevo Engineer; los pesos de la PBUNet anterior no cargan en la nueva arquitectura. El *Stable Target Field* del ejemplo bidimensional no se traslada a imágenes 64 × 64: el Architect usa el objetivo `v` estándar.
+El Architect no usa `fz` como entrada. La carga actúa en el Engineer y en el guiado, igual que en el pipeline original sin condición tipológica. Ambos checkpoints deben indicar el mismo `cosine_s`; los antiguos checkpoints de Flow Matching **lineal** y DDPM se rechazan, pero los `cosine_vp_v` de este repo sí se aceptan y se reescalan solos. Hay que entrenar el nuevo Engineer; los pesos de la PBUNet anterior no cargan en la nueva arquitectura. El *Stable Target Field* del ejemplo bidimensional no se traslada a imágenes 64 × 64: el Architect usa el objetivo de flow matching estándar sobre la trayectoria coseno.
+
+El guiado se calcula siempre en unidades `dx/dφ` y se reescala a `dx/dt` al final, así que `guidance_scale` significa lo mismo con cualquier solver y no hay que recalibrar `γ` al cambiarlo.
 
 ## Datos y requisitos
 

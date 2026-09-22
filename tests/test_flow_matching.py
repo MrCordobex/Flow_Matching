@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -7,6 +8,14 @@ from unittest.mock import patch
 import torch
 import yaml
 
+from tfm_shells.cosine_flow import (
+    FLOW_METHOD,
+    CosineFlowPath,
+    denoised_from_velocity,
+    integrate_cosine_flow,
+    project_velocity,
+    sample_cosine_flow_path,
+)
 from tfm_shells.flow import integrate_flow, model_time
 from tfm_shells.models.factory import build_unet
 from tfm_shells.sampling.guided import SamplingContext, _check_vp_checkpoint, generate_samples
@@ -123,6 +132,211 @@ class FlowMatchingTests(unittest.TestCase):
         noise = (state - a * clean) / s
         self.assertTrue(torch.allclose(target, a * noise - s * clean, atol=1e-5))
         self.assertEqual(float(vp_model_time(1.0, 1, torch.device("cpu"))[0]), 999.0)
+
+    def test_cosine_flow_velocity_is_the_path_time_derivative(self) -> None:
+        path = CosineFlowPath(0.008)
+        clean = torch.randn(4, 1, 4, 4, dtype=torch.float64)
+        noise = torch.randn_like(clean)
+        t = torch.tensor(0.37, dtype=torch.float64, requires_grad=True)
+
+        def state_at(time: torch.Tensor) -> torch.Tensor:
+            alpha, sigma = path.alpha_sigma(time)
+            return alpha * clean + sigma * noise
+
+        # Autograd through the path must reproduce the analytic flow velocity.
+        numeric = torch.autograd.grad(state_at(t).sum(), t)[0]
+        alpha, sigma = path.alpha_sigma(t.detach())
+        analytic = path.velocity_from_v(alpha * noise - sigma * clean)
+        self.assertTrue(torch.allclose(numeric, analytic.sum(), atol=1e-9))
+        self.assertAlmostEqual(path.rate, torch.pi / (2 * 1.008), places=12)
+
+    def test_flow_target_is_the_v_target_scaled_by_the_angular_rate(self) -> None:
+        path = CosineFlowPath(0.008)
+        clean = torch.randn(8, 1, 4, 4)
+        torch.manual_seed(5)
+        vp_state, vp_time, vp_target = sample_vp_path(clean, path.schedule)
+        torch.manual_seed(5)
+        flow_state, flow_time, flow_target = sample_cosine_flow_path(clean, path)
+        # Identical states and times keep the Engineer and its 999t embedding valid.
+        self.assertTrue(torch.equal(vp_state, flow_state))
+        self.assertTrue(torch.equal(vp_time, flow_time))
+        self.assertTrue(torch.allclose(flow_target, path.rate * vp_target, atol=1e-6))
+        self.assertTrue(torch.allclose(path.v_from_velocity(flow_target), vp_target, atol=1e-6))
+
+    def test_exponential_solver_reproduces_ddim_on_the_same_field(self) -> None:
+        path = CosineFlowPath(0.008)
+        initial = torch.randn(2, 1, 4, 4)
+        constant = torch.randn(2, 1, 4, 4)
+        ddim = sample_ddim(lambda x, t: constant, initial.clone(), 6, path.schedule,
+                           spacing="quadratic", eta=0.0)
+        flow = integrate_cosine_flow(lambda x, t: path.velocity_from_v(constant),
+                                     initial.clone(), 6, path,
+                                     spacing="quadratic", solver="exponential")
+        self.assertTrue(torch.allclose(ddim, flow, atol=1e-6))
+
+    @staticmethod
+    def _oracle_problem(seed: int = 0):
+        """Exact cosine path plus the analytic field that generates it."""
+        path = CosineFlowPath(0.008)
+        generator = torch.Generator().manual_seed(seed)
+        clean = torch.full((1, 1, 4, 4), 0.35, dtype=torch.float64)
+        noise = torch.randn(1, 1, 4, 4, dtype=torch.float64, generator=generator)
+        alpha, sigma = path.alpha_sigma(torch.tensor(1.0, dtype=torch.float64))
+        initial = alpha * clean + sigma * noise
+
+        def oracle(state: torch.Tensor, t: float) -> torch.Tensor:
+            a, s = path.alpha_sigma(torch.tensor(t, dtype=state.dtype))
+            return path.velocity_from_v(a * noise - s * clean)
+
+        return path, clean, noise, initial, oracle
+
+    def test_each_solver_converges_at_its_theoretical_order(self) -> None:
+        path, clean, _, initial, oracle = self._oracle_problem()
+        for solver, expected in (("euler", 1.0), ("midpoint", 2.0), ("heun", 2.0), ("rk4", 4.0)):
+            with self.subTest(solver=solver):
+                errors = []
+                for steps in (32, 64, 128):
+                    result = integrate_cosine_flow(oracle, initial.clone(), steps, path,
+                                                   spacing="uniform", solver=solver)
+                    errors.append(float((result - clean).abs().max()))
+                # Halving the step must divide the error by 2**order.
+                for coarse, fine in zip(errors, errors[1:]):
+                    order = math.log2(coarse / fine)
+                    self.assertAlmostEqual(order, expected, delta=0.15)
+
+    def test_exponential_solver_is_exact_for_the_cosine_path(self) -> None:
+        path, clean, _, initial, oracle = self._oracle_problem()
+        for steps in (2, 8, 64):
+            result = integrate_cosine_flow(oracle, initial.clone(), steps, path,
+                                           spacing="uniform", solver="exponential")
+            self.assertLess(float((result - clean).abs().max()), 1e-12)
+
+    def test_final_denoise_removes_the_residual_noise_left_by_the_cosine_offset(self) -> None:
+        path, clean, noise, initial, oracle = self._oracle_problem()
+        alpha_zero, sigma_zero = path.alpha_sigma(torch.tensor(0.0, dtype=torch.float64))
+        self.assertGreater(float(sigma_zero), 0.01)
+
+        raw = integrate_cosine_flow(oracle, initial.clone(), 256, path, spacing="uniform",
+                                    solver="rk4", final_denoise=False)
+        denoised = integrate_cosine_flow(oracle, initial.clone(), 256, path, spacing="uniform",
+                                         solver="rk4", final_denoise=True)
+        # Without the closing projection the ODE lands on the true t=0 state,
+        # which still carries sigma(0) * eps of white noise per pixel.
+        self.assertTrue(torch.allclose(raw, alpha_zero * clean + sigma_zero * noise, atol=1e-8))
+        self.assertLess(float((denoised - clean).abs().max()), 1e-8)
+        self.assertGreater(float((raw - clean).abs().max()), 0.01)
+
+    def test_velocity_projection_is_identity_inside_the_range(self) -> None:
+        path = CosineFlowPath(0.008)
+        state = torch.randn(2, 1, 4, 4, dtype=torch.float64)
+        t = 0.6
+        alpha, sigma = path.alpha_sigma(torch.tensor(t, dtype=torch.float64))
+        clean = torch.full_like(state, 0.5)
+        noise = (state - alpha * clean) / sigma
+        velocity = path.velocity_from_v(alpha * noise - sigma * clean)
+        self.assertTrue(torch.allclose(project_velocity(state, velocity, t, path),
+                                       velocity, atol=1e-9))
+        recovered, _ = denoised_from_velocity(state, velocity, t, path)
+        self.assertTrue(torch.allclose(recovered, clean, atol=1e-9))
+
+    def test_velocity_projection_clamps_an_out_of_range_shell(self) -> None:
+        path = CosineFlowPath(0.008)
+        state = torch.randn(2, 1, 4, 4, dtype=torch.float64)
+        t = 0.6
+        alpha, sigma = path.alpha_sigma(torch.tensor(t, dtype=torch.float64))
+        clean = torch.full_like(state, 4.0)
+        noise = (state - alpha * clean) / sigma
+        velocity = path.velocity_from_v(alpha * noise - sigma * clean)
+        projected = project_velocity(state, velocity, t, path)
+        self.assertFalse(torch.allclose(projected, velocity))
+        # Projection is idempotent: the rebuilt clean estimate is exactly the clamp.
+        reclean, _ = denoised_from_velocity(state, projected, t, path)
+        self.assertTrue(torch.allclose(reclean, torch.ones_like(clean), atol=1e-9))
+        self.assertTrue(torch.allclose(project_velocity(state, projected, t, path),
+                                       projected, atol=1e-9))
+
+    def test_flow_checkpoint_is_rescaled_to_v_units_when_sampling(self) -> None:
+        path = CosineFlowPath(0.008)
+        seen: list[torch.Tensor] = []
+
+        class FlowArchitect:
+            def __call__(self, x, t):
+                velocity = torch.full_like(x, 0.25)
+                seen.append(velocity)
+                return type("Output", (), {"sample": velocity})()
+
+        context = SamplingContext(
+            architect=FlowArchitect(), engineer=None, architect_stats={}, engineer_stats={},
+            fz_condition=torch.zeros(1, 1, 4, 4), device=torch.device("cpu"), source_file=None,
+            vp_schedule=path.schedule, flow_path=path, net_to_v=1.0 / path.rate,
+            architect_method=FLOW_METHOD,
+        )
+        config = {"sampling": {"guidance_scale": 0.0, "grad_clip": 5.0,
+                               "eta": 0.0, "time_spacing": "uniform"}}
+        initial = torch.randn(1, 1, 4, 4)
+        # A dx/dt network driven through DDIM must equal a dx/dphi network
+        # carrying the same field divided by the angular rate.
+        flow_result, _ = generate_samples(context, config, initial.clone(), 5, "ddim")
+        reference = sample_ddim(lambda x, t: torch.full_like(x, 0.25 / path.rate),
+                                initial.clone(), 5, path.schedule, spacing="uniform", eta=0.0)
+        self.assertTrue(torch.allclose(flow_result, reference, atol=1e-6))
+
+    def test_guided_sampling_runs_under_every_ode_solver(self) -> None:
+        path = CosineFlowPath(0.008)
+
+        class ZeroArchitect:
+            def __call__(self, x, t):
+                return type("Output", (), {"sample": torch.zeros_like(x)})()
+
+        context = SamplingContext(
+            architect=ZeroArchitect(), engineer=None, architect_stats={}, engineer_stats={},
+            fz_condition=torch.zeros(1, 1, 4, 4), device=torch.device("cpu"), source_file=None,
+            vp_schedule=path.schedule, flow_path=path, net_to_v=1.0 / path.rate,
+            architect_method=FLOW_METHOD,
+        )
+        config = {"sampling": {"guidance_scale": 0.0, "grad_clip": 5.0, "eta": 0.0,
+                               "time_spacing": "quadratic", "clip_denoised": True}}
+        initial = torch.randn(1, 1, 4, 4)
+        for solver in ("exponential", "euler", "midpoint", "heun", "rk4"):
+            with self.subTest(solver=solver):
+                states, history = generate_samples(context, config, initial.clone(), 4, solver)
+                self.assertTrue(torch.isfinite(states).all())
+                self.assertLessEqual(float(states.abs().max()), 1.0 + 1e-6)
+                self.assertEqual(len(history["t"]), 4)
+        with self.assertRaisesRegex(ValueError, "solver must be"):
+            generate_samples(context, config, initial.clone(), 4, "dopri5")
+
+    def test_architect_training_accepts_the_flow_method(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with (root / "configs" / "architect.yaml").open(encoding="utf-8") as handle:
+            architect = yaml.safe_load(handle)
+        self.assertEqual(architect["model"]["method"], FLOW_METHOD)
+
+        path = CosineFlowPath(0.008)
+
+        class ConstantArchitect(torch.nn.Module):
+            """Emits a fixed field, scaled to whichever parameterization is used."""
+
+            def __init__(self, scale: float):
+                super().__init__()
+                self.scale = scale
+
+            def forward(self, x, t):
+                return type("Output", (), {"sample": torch.full_like(x, 0.3 * self.scale)})()
+
+        batch = [{"z": torch.randn(4, 1, 4, 4)}]
+        torch.manual_seed(3)
+        flow = run_architect_epoch(ConstantArchitect(path.rate), batch, path.schedule, None,
+                                   torch.device("cpu"), False, 1.0, 1, 1, "test", flow_path=path)
+        torch.manual_seed(3)
+        vp = run_architect_epoch(ConstantArchitect(1.0), batch, path.schedule, None,
+                                 torch.device("cpu"), False, 1.0, 1, 1, "test")
+        # Equivalent predictors on identical states: the flow objective is exactly
+        # k^2 times the v objective, and loss_v_units undoes that so a flow run can
+        # be read against the curves of a v run.
+        self.assertAlmostEqual(flow["loss"], vp["loss"] * path.rate ** 2, places=5)
+        self.assertAlmostEqual(flow["loss_v_units"], vp["loss"], places=5)
+        self.assertAlmostEqual(vp["loss_v_units"], vp["loss"], places=9)
 
     def test_balanced_supervision_weights_each_branch_equally(self) -> None:
         pred = torch.zeros(1, 13, 2, 2)

@@ -12,8 +12,13 @@ engineer:
 
 sampling:
   num_inference_steps: 50
+  # ddim / exponential: integrador exponencial, exacto para la trayectoria coseno
+  #   si (z_hat, eps_hat) fueran constantes en el paso. Una evaluación por paso.
+  # euler | midpoint | heun | rk4: integradores ODE genéricos de dx/dt = u.
+  #   midpoint y heun cuestan 2 evaluaciones por paso; rk4 cuesta 4.
+  # ddpm: posterior ancestral VP, estocástico.
   solver: ddim
-  eta: 0.0  # Sólo DDIM. solver: ddpm usa internamente eta=1.0.
+  eta: 0.0  # Sólo para solver: ddim. solver: ddpm usa internamente eta=1.0.
   clip_denoised: false  # true: recorta la geometría limpia normalizada a [-1, 1].
   time_spacing: quadratic
   guidance_scale: 1.0

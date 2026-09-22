@@ -30,7 +30,9 @@ model:
     - UpBlock2D
     - UpBlock2D
     - UpBlock2D
-  method: vp_diffusion_v
+  # cosine_flow_u: flow matching, regresses dx/dt on the cosine interpolant.
+  # vp_diffusion_v: previous parameterization, regresses dx/dphi. Same path.
+  method: cosine_flow_u
   cosine_s: 0.008
 
 training:
@@ -47,11 +49,12 @@ training:
   sample_batch_size: 6
   sample_inference_steps: 50
   sample_time_spacing: quadratic
-  sample_eta: 0.0
+  sample_eta: 0.0  # Sólo para vp_diffusion_v.
+  sample_solver: heun  # ODE de entrenamiento: exponential, euler, midpoint, heun, rk4.
 
 mlflow:
   tracking_uri: ./mlruns
-  experiment_name: architect_vp_ddim_solid
+  experiment_name: architect_cosine_flow_solid
   run_name_prefix: architect
   tags:
     model_role: architect

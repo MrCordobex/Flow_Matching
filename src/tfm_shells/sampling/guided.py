@@ -16,6 +16,12 @@ import torch
 from tqdm.auto import tqdm
 
 from tfm_shells.config import load_config, resolve_project_path, save_config
+from tfm_shells.cosine_flow import (
+    FLOW_METHOD,
+    SOLVER_STAGES,
+    CosineFlowPath,
+    integrate_cosine_flow,
+)
 from tfm_shells.vp_diffusion import CosineVPSchedule, sample_ddim, sample_ddpm, vp_model_time
 from tfm_shells.models.factory import build_unet
 from tfm_shells.training.common import (
@@ -41,6 +47,10 @@ class SamplingContext:
     device: torch.device
     source_file: Path
     vp_schedule: CosineVPSchedule = field(default_factory=CosineVPSchedule)
+    flow_path: CosineFlowPath = field(default_factory=CosineFlowPath)
+    # 1.0 when the network already emits dx/dphi, 1/rate when it emits dx/dt.
+    net_to_v: float = 1.0
+    architect_method: str = "cosine_vp_v"
 
 
 def _normalize(array: np.ndarray, low: float, high: float) -> np.ndarray:
@@ -52,11 +62,13 @@ def _architect_to_engineer(x: torch.Tensor, arch: dict, eng: dict) -> torch.Tens
     return 2.0 * (real - float(eng["z_min"])) / (float(eng["z_max"]) - float(eng["z_min"]) + 1e-8) - 1.0
 
 
-def _check_vp_checkpoint(ckpt: dict, role: str, method: str) -> dict[str, Any]:
+def _check_vp_checkpoint(ckpt: dict, role: str, method: str | set[str]) -> dict[str, Any]:
+    accepted = {method} if isinstance(method, str) else set(method)
     diffusion = ckpt.get("diffusion_config", {})
-    if (diffusion.get("method") != method or float(diffusion.get("time_scale", -1)) != 999.0
+    if (diffusion.get("method") not in accepted or float(diffusion.get("time_scale", -1)) != 999.0
             or "cosine_s" not in diffusion):
-        raise ValueError(f"{role} checkpoint must use the cosine VP schedule ({method}); retrain older flow checkpoints")
+        names = " or ".join(sorted(accepted))
+        raise ValueError(f"{role} checkpoint must use the cosine VP schedule ({names}); retrain older flow checkpoints")
     return diffusion
 
 
@@ -65,7 +77,7 @@ def load_sampling_context(config: dict[str, Any], device: torch.device) -> Sampl
     eng_path = resolve_project_path(config, config["engineer"]["checkpoint"])
     arch_ckpt = torch.load(arch_path, map_location=device, weights_only=False)
     eng_ckpt = torch.load(eng_path, map_location=device, weights_only=False)
-    arch_diffusion = _check_vp_checkpoint(arch_ckpt, "Architect", "cosine_vp_v")
+    arch_diffusion = _check_vp_checkpoint(arch_ckpt, "Architect", {"cosine_vp_v", FLOW_METHOD})
     eng_diffusion = _check_vp_checkpoint(eng_ckpt, "Engineer", "cosine_vp_conditioned")
     if float(arch_diffusion["cosine_s"]) != float(eng_diffusion["cosine_s"]):
         raise ValueError("Architect and Engineer checkpoints use different VP cosine schedules")
@@ -89,8 +101,15 @@ def load_sampling_context(config: dict[str, Any], device: torch.device) -> Sampl
     eng_stats = eng_ckpt["normalization_stats"]
     fz_normalized = _normalize(fz, float(eng_stats["fz_min"]), float(eng_stats["fz_max"]))
     fz_tensor = torch.from_numpy(fz_normalized).unsqueeze(0).to(device)
+    cosine_s = float(arch_diffusion["cosine_s"])
+    flow_path = CosineFlowPath(cosine_s)
+    architect_method = str(arch_diffusion["method"])
+    # Everything downstream works in dx/dphi units, so a flow network is divided
+    # by the constant angular rate once, here.
+    net_to_v = 1.0 / flow_path.rate if architect_method == FLOW_METHOD else 1.0
     return SamplingContext(architect, engineer, arch_ckpt["normalization_stats"], eng_stats,
-                           fz_tensor, device, source, CosineVPSchedule(float(arch_diffusion["cosine_s"])))
+                           fz_tensor, device, source, CosineVPSchedule(cosine_s),
+                           flow_path, net_to_v, architect_method)
 
 
 def _guide_weight(config: dict[str, Any], t: float) -> float:
@@ -127,8 +146,8 @@ def generate_samples(
 ) -> tuple[torch.Tensor, dict[str, list[float]]]:
     if initial.ndim != 4 or initial.shape[1] != 1:
         raise ValueError("initial noise must have shape (B, 1, H, W)")
-    if solver not in {"ddim", "ddpm"}:
-        raise ValueError("VP sampling requires solver='ddim' or solver='ddpm'")
+    if solver not in {"ddim", "ddpm"} | set(SOLVER_STAGES):
+        raise ValueError(f"solver must be ddim, ddpm or one of {sorted(SOLVER_STAGES)}")
     scale = float(config["sampling"]["guidance_scale"])
     clip = float(config["sampling"]["grad_clip"])
     eta = float(config["sampling"].get("eta", 0.0))
@@ -140,8 +159,10 @@ def generate_samples(
     diagnostic: dict[str, float] = {}
 
     def velocity_field(state: torch.Tensor, t: float) -> torch.Tensor:
+        """Guided dx/dphi. A flow checkpoint is rescaled to these units by net_to_v."""
         with torch.no_grad():
-            velocity = context.architect(state, vp_model_time(t, state.shape[0], context.device)).sample
+            raw = context.architect(state, vp_model_time(t, state.shape[0], context.device)).sample
+            velocity = raw * context.net_to_v
         if scale == 0.0:
             diagnostic.update(objective=float("nan"), mf_mean=float("nan"), grad_norm=0.0, guide_weight=0.0)
             return velocity
@@ -161,7 +182,11 @@ def generate_samples(
         _, sigma = context.vp_schedule.alpha_sigma(torch.as_tensor(t, device=state.device))
         return velocity + sigma * correction.detach()
 
-    progress = tqdm(total=steps, desc=f"VP {solver.upper()} sampling", disable=not show_progress)
+    def flow_field(state: torch.Tensor, t: float) -> torch.Tensor:
+        """dx/dt for the ODE solvers. Guidance rides along, already in dx/dphi."""
+        return context.flow_path.velocity_from_v(velocity_field(state, t))
+
+    progress = tqdm(total=steps, desc=f"cosine {solver} sampling", disable=not show_progress)
 
     def record(index: int, t: float, state: torch.Tensor) -> None:
         history["t"].append(t)
@@ -174,10 +199,14 @@ def generate_samples(
             result = sample_ddpm(velocity_field, initial, steps, context.vp_schedule,
                                  spacing=spacing, step_callback=record,
                                  clip_denoised=clip_denoised)
-        else:
+        elif solver == "ddim":
             result = sample_ddim(velocity_field, initial, steps, context.vp_schedule,
                                  spacing=spacing, eta=eta, step_callback=record,
                                  clip_denoised=clip_denoised)
+        else:
+            result = integrate_cosine_flow(flow_field, initial, steps, context.flow_path,
+                                           spacing=spacing, solver=solver,
+                                           clip_denoised=clip_denoised, step_callback=record)
     finally:
         progress.close()
     return result, history
@@ -228,13 +257,17 @@ def run_guided_sampling(config_path: str | Path) -> dict[str, Any]:
     figure.savefig(history_png, dpi=180)
     plt.close(figure)
 
+    stages = SOLVER_STAGES.get(solver, 1)
     summary = {
-        "method": f"cosine_vp_v_{solver}",
+        "method": f"{context.architect_method}_{solver}",
+        "architect_parameterization": "dx_dt" if context.net_to_v != 1.0 else "dx_dphi",
         "solver": solver,
-        "eta": 1.0 if solver == "ddpm" else float(config["sampling"].get("eta", 0.0)),
+        "eta": (1.0 if solver == "ddpm"
+                else float(config["sampling"].get("eta", 0.0)) if solver == "ddim" else 0.0),
         "clip_denoised": bool(config["sampling"].get("clip_denoised", False)),
         "time_spacing": str(config["sampling"].get("time_spacing", "quadratic")),
         "num_inference_steps": steps,
+        "architect_evaluations": steps * stages,
         "guidance_scale": float(config["sampling"]["guidance_scale"]),
         "samples_generated": batch_size,
         "sample_shape": list(samples.shape),

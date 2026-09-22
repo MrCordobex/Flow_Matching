@@ -1,4 +1,4 @@
-"""Paired numerical convergence experiment for deterministic VP DDIM."""
+"""Paired numerical convergence experiment for the deterministic cosine samplers."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from tfm_shells.config import load_config, resolve_project_path
+from tfm_shells.cosine_flow import SOLVER_STAGES
 from tfm_shells.sampling.guided import denormalize_samples, evaluate_clean_mf, generate_samples, load_sampling_context
 from tfm_shells.training.common import resolve_device, seed_everything
 from tfm_shells.utils.io import save_json
@@ -24,8 +25,11 @@ def benchmark_steps(config_path: Path, steps: list[int], reference_steps: int, o
     size = int(context.architect.config.sample_size)
     initial = torch.randn((batch_size, 1, size, size), device=device)
     solver = str(config["sampling"].get("solver", "ddim"))
-    if solver != "ddim" or float(config["sampling"].get("eta", 0.0)) != 0.0:
-        raise ValueError("The paired DDIM step benchmark requires solver=ddim and eta=0")
+    if solver == "ddim" and float(config["sampling"].get("eta", 0.0)) != 0.0:
+        raise ValueError("The paired step benchmark requires eta=0 when solver=ddim")
+    if solver not in {"ddim"} | set(SOLVER_STAGES):
+        raise ValueError("The paired step benchmark needs a deterministic solver, not ddpm")
+    stages = SOLVER_STAGES.get(solver, 1)
     counts = sorted(set([reference_steps, *steps]))
     if any(count < 1 for count in counts):
         raise ValueError("All step counts must be positive")
@@ -56,7 +60,8 @@ def benchmark_steps(config_path: Path, steps: list[int], reference_steps: int, o
             "solver": solver,
             "guided": float(config["sampling"]["guidance_scale"]) > 0,
             "seconds": elapsed,
-            "model_evaluations": count,
+            "model_evaluations": count * stages,
+            "solver_stages": stages,
             "mf_mean": float(mf.mean()),
             "mf_std": float(mf.std()),
             "p_mf_gt_090": float((mf > 0.90).mean()),
@@ -72,6 +77,8 @@ def benchmark_steps(config_path: Path, steps: list[int], reference_steps: int, o
         writer.writerows(rows)
     save_json(
         {"reference_steps": reference_steps, "solver": solver, "eta": 0.0,
+         "solver_stages": stages,
+         "architect_method": context.architect_method,
          "time_spacing": str(config["sampling"].get("time_spacing", "quadratic")),
          "seed": int(config["seed"]),
          "batch_size": batch_size, "guidance_scale": float(config["sampling"]["guidance_scale"]),

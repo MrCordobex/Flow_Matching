@@ -19,6 +19,12 @@ from tqdm.auto import tqdm
 from tfm_shells.config import load_config, resolve_project_path
 from tfm_shells.data.dataset import ShellDataset, compute_normalization_stats
 from tfm_shells.data.index import build_dataset_index, dataset_summary, filter_records, split_records
+from tfm_shells.cosine_flow import (
+    FLOW_METHOD,
+    CosineFlowPath,
+    integrate_cosine_flow,
+    sample_cosine_flow_path,
+)
 from tfm_shells.vp_diffusion import CosineVPSchedule, sample_ddim, sample_vp_path, vp_model_time
 from tfm_shells.models.factory import build_unet, count_parameters
 from tfm_shells.training.common import (
@@ -46,12 +52,17 @@ def _sample_images(
     schedule: CosineVPSchedule,
     spacing: str = "quadratic",
     eta: float = 0.0,
+    flow_path: CosineFlowPath | None = None,
+    flow_solver: str = "heun",
 ) -> torch.Tensor:
     model.eval()
     samples = torch.randn((batch_size, 1, height, width), device=device)
     def field(state: torch.Tensor, t: float) -> torch.Tensor:
         return model(state, vp_model_time(t, state.shape[0], device)).sample
-    return sample_ddim(field, samples, num_steps, schedule, spacing, eta)
+    if flow_path is None:
+        return sample_ddim(field, samples, num_steps, schedule, spacing, eta)
+    return integrate_cosine_flow(field, samples, num_steps, flow_path,
+                                 spacing=spacing, solver=flow_solver)
 
 
 def _save_sample_grid(
@@ -92,7 +103,9 @@ def _run_epoch(
     total_epochs: int,
     phase: str,
     after_optimizer_step: Callable[[], None] | None = None,
+    flow_path: CosineFlowPath | None = None,
 ) -> dict[str, float]:
+    """Regress the path velocity. With `flow_path` the target is dx/dt, else dx/dphi."""
     is_train = optimizer is not None
     model.train(is_train)
     use_amp = mixed_precision and device.type == "cuda"
@@ -109,7 +122,10 @@ def _run_epoch(
         for batch in progress:
             z_clean = batch["z"].to(device, non_blocking=True)
             batch_size = z_clean.shape[0]
-            state, time, target = sample_vp_path(z_clean, schedule)
+            if flow_path is None:
+                state, time, target = sample_vp_path(z_clean, schedule)
+            else:
+                state, time, target = sample_cosine_flow_path(z_clean, flow_path)
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -131,7 +147,11 @@ def _run_epoch(
             total_items += batch_size
             progress.set_postfix(loss=format_metric(total_loss / max(total_items, 1)), refresh=False)
 
-    return {"loss": total_loss / max(total_items, 1)}
+    mean_loss = total_loss / max(total_items, 1)
+    # dx/dt = k dx/dphi, so the flow loss is k^2 times the v loss. Rescaling keeps
+    # the curves comparable with runs trained under the v parameterization.
+    scale = 1.0 if flow_path is None else flow_path.rate ** 2
+    return {"loss": mean_loss, "loss_v_units": mean_loss / scale}
 
 
 def train_architect(
@@ -139,9 +159,14 @@ def train_architect(
     role: str = "architect",
 ) -> dict[str, Any]:
     config = load_config(config_path)
-    if config["model"].get("method") != "vp_diffusion_v":
-        raise ValueError("Architect model.method must be vp_diffusion_v")
-    vp_schedule = CosineVPSchedule(float(config["model"].get("cosine_s", 0.008)))
+    method = str(config["model"].get("method", ""))
+    if method not in {"vp_diffusion_v", FLOW_METHOD}:
+        raise ValueError(f"Architect model.method must be vp_diffusion_v or {FLOW_METHOD}")
+    cosine_s = float(config["model"].get("cosine_s", 0.008))
+    vp_schedule = CosineVPSchedule(cosine_s)
+    # Both methods ride the same cosine path; only the regression target differs.
+    flow_path = CosineFlowPath(cosine_s) if method == FLOW_METHOD else None
+    flow_solver = str(config["training"].get("sample_solver", "heun"))
     seed_everything(int(config["seed"]))
     directories = prepare_run_directories(config, role=role)
     device = resolve_device(str(config["runtime"]["device"]))
@@ -237,6 +262,11 @@ def train_architect(
         print("\n" + "=" * 96)
         print("ARCHITECT TRAINING")
         print(f"config: {config['_meta']['config_path']}")
+        if flow_path is not None:
+            print(f"method: cosine flow matching (target dx/dt, rate={flow_path.rate:.6f}, "
+                  f"sampler={flow_solver})")
+        else:
+            print("method: cosine VP v prediction (target dx/dphi, sampler=ddim)")
         print(f"device: {device}")
         print(f"dataset: {dataset_dir}")
         print(
@@ -280,6 +310,7 @@ def train_architect(
                 total_epochs=total_epochs,
                 phase="train",
                 after_optimizer_step=update_ema,
+                flow_path=flow_path,
             )
             val_metrics = _run_epoch(
                 model=ema_model,
@@ -292,6 +323,7 @@ def train_architect(
                 epoch=epoch,
                 total_epochs=total_epochs,
                 phase="val",
+                flow_path=flow_path,
             )
             lr_scheduler.step(val_metrics["loss"])
             current_lr = float(optimizer.param_groups[0]["lr"])
@@ -300,6 +332,8 @@ def train_architect(
                 "epoch": epoch,
                 "train_loss": train_metrics["loss"],
                 "val_loss": val_metrics["loss"],
+                "train_loss_v_units": train_metrics["loss_v_units"],
+                "val_loss_v_units": val_metrics["loss_v_units"],
                 "learning_rate": current_lr,
             }
             history_rows.append(row)
@@ -311,8 +345,16 @@ def train_architect(
                 "model_state_dict": ema_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "model_config": config["model"],
-                "diffusion_config": {"method": "cosine_vp_v", "cosine_s": vp_schedule.s,
-                                     "time_scale": 999.0, "sampler": "ddim", "ema_decay": ema_decay},
+                "diffusion_config": {
+                    "method": "cosine_flow_u" if flow_path else "cosine_vp_v",
+                    "parameterization": "dx_dt" if flow_path else "dx_dphi",
+                    "path": "cosine",
+                    "cosine_s": vp_schedule.s,
+                    "angular_rate": flow_path.rate if flow_path else None,
+                    "time_scale": 999.0,
+                    "sampler": flow_solver if flow_path else "ddim",
+                    "ema_decay": ema_decay,
+                },
                 "normalization_stats": stats,
                 "config_path": str(config["_meta"]["config_path"]),
                 "dataset_summary": splits["dataset_summary"],
@@ -355,6 +397,8 @@ def train_architect(
                     schedule=vp_schedule,
                     spacing=str(config["training"].get("sample_time_spacing", "quadratic")),
                     eta=float(config["training"].get("sample_eta", 0.0)),
+                    flow_path=flow_path,
+                    flow_solver=flow_solver,
                 )
                 sample_path = directories["run_root"] / f"samples_epoch_{epoch:03d}.png"
                 _save_sample_grid(samples, stats, sample_path)
