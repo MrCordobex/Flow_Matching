@@ -15,6 +15,7 @@ from typing import Any, Iterator
 # Guidance strength of the published configuration: guidance_scale 250 x w_max 8.
 PAPER_SCALE, PAPER_W_MAX = 250.0, 8.0
 FULL_STEPS = 1000
+DEFAULT_SEED = 20260922  # initial-noise pool shared by every run of b1-b8
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class Run:
     engineer: str = "pbunet"     # pbunet | hybrid
     guide_every: int = 1         # evaluate the surrogate every n-th step
     tag: str = ""
+    seed: int = DEFAULT_SEED     # a new pool only for the confirmation block
 
     @property
     def run_id(self) -> str:
@@ -45,6 +47,8 @@ class Run:
             parts.append(f"every{self.guide_every}")
         if self.tag:
             parts.append(self.tag)
+        if self.seed != DEFAULT_SEED:  # appended only when changed: b1-b5 ids stay valid
+            parts.append(f"seed{self.seed}")
         return "__".join(parts)
 
     @property
@@ -106,12 +110,56 @@ def block5_sparse_guidance() -> Iterator[Run]:
         yield Run(block="b5", steps=100, eta=1.0, guide_every=every)
 
 
+# b6: the regime the published paper recommends (gamma 10-50, w_max 8), see
+# PREREGISTRO.md. K=100 stands in for the full budget.
+B6_GAMMAS = (10.0, 25.0, 50.0, 100.0)
+B6_STEPS = (10, 20, 100)
+B6_EVALUATORS = (  # (provider, engineer)
+    ("noise_aware", "pbunet"),
+    ("noise_aware", "hybrid"),
+    ("tweedie_clean", "pbunet"),
+    ("tweedie_self", "pbunet"),
+)
+
+
+def block6_smooth_regime() -> Iterator[Run]:
+    """H1-H3: every evaluator across the recommended guidance range and three budgets."""
+    for provider, engineer in B6_EVALUATORS:
+        for scale in B6_GAMMAS:
+            for steps in B6_STEPS:
+                yield Run(block="b6", provider=provider, engineer=engineer, steps=steps,
+                          eta=1.0, guidance_scale=scale)
+
+
+def block6_reference() -> Iterator[Run]:
+    """The saturated b1 setting again, now with per-sample guidance instrumentation."""
+    for provider, engineer in B6_EVALUATORS:
+        for steps in B6_STEPS:
+            yield Run(block="b6r", provider=provider, engineer=engineer, steps=steps, eta=1.0)
+
+
+def block6_twins() -> Iterator[Run]:
+    """Unguided twins: same initial and ancestral noise, so guidance effects are paired."""
+    for steps in B6_STEPS:
+        yield Run(block="b6u", steps=steps, eta=1.0, guidance_scale=0.0)
+
+
+def block6_anchor() -> Iterator[Run]:
+    """Checks that K=100 stands in for K=1000 in the recommended regime."""
+    for provider in ("noise_aware", "tweedie_clean"):
+        yield Run(block="b6a", provider=provider, steps=FULL_STEPS, eta=1.0, guidance_scale=10.0)
+
+
 BLOCKS = {
     "b1": block1_frontier,
     "b2": block2_stochasticity,
     "b3": block3_guidance_scale,
     "b4": block4_cheap_surrogate,
     "b5": block5_sparse_guidance,
+    "b6": block6_smooth_regime,
+    "b6r": block6_reference,
+    "b6u": block6_twins,
+    "b6a": block6_anchor,
 }
 
 

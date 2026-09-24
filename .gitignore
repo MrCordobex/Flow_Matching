@@ -22,7 +22,7 @@ __pycache__/
 artifacts/
 /models/
 mlruns/
-
+results/
 # OS / editors
 .DS_Store
 Thumbs.db

@@ -31,7 +31,9 @@ class Surrogate:
 
 
 def _load(path: Path, device: torch.device) -> dict[str, Any]:
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    # mmap keeps the 4 GB checkpoints (weights + optimizer) out of RAM until
+    # the tensors that are actually used get touched.
+    checkpoint = torch.load(path, map_location=device, weights_only=False, mmap=True)
     checkpoint.pop("optimizer_state_dict", None)
     return checkpoint
 
