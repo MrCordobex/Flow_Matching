@@ -1,3 +1,4 @@
+# Control for engineer.yaml: identical except for uniform timestep sampling (PREREGISTRO, phase 3).
 seed: 42
 
 data:
@@ -36,12 +37,12 @@ training:
   learning_rate: 1.0e-4
   weight_decay: 1.0e-4
   grad_clip_norm: 1.0
-  lr_patience: 8
+  lr_patience: 5
   lr_factor: 0.5
   early_stopping_patience: 15
   mixed_precision: false
   lambda_max: 1.0e-3
-  warmup_epochs: 10
+  warmup_epochs: 5
   timestep_power: 2.0          # weight of the virtual-work term, (1 - t)^p; unrelated to sampling below
   # Distribution of training timesteps. uniform: t ~ U(0, 1). power: t = u^exponent, u ~ U(0, 1);
   # exponent 2 puts 45% of the samples at t <= 0.2 (vs 20%) and 11% at t >= 0.8 (vs 20%).
@@ -55,7 +56,7 @@ training:
     poisson_ratio: 0.2
     thickness: 0.1
     lambda_max: 0.05
-    warmup_epochs: 10
+    warmup_epochs: 5
   gradient:
     enabled: true
     lambda_max: 0.05
@@ -64,7 +65,7 @@ training:
 mlflow:
   tracking_uri: ./mlruns
   experiment_name: engineer_vp_fourier_unet_solid
-  run_name_prefix: engineer_hybrid_t0
+  run_name_prefix: engineer_hybrid_base
   tags:
     model_role: engineer
     stage: thesis

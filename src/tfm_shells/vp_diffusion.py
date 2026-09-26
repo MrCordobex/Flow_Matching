@@ -27,6 +27,35 @@ class CosineVPSchedule:
         return torch.cos(angle).clamp_min(0.0), torch.sin(angle).clamp_min(0.0)
 
 
+class DiscreteCosineSchedule:
+    """The integer-grid cosine schedule of the Diffusers DDPMScheduler.
+
+    The published Architect was trained on integer timesteps 0..999 with
+    `squaredcos_cap_v2` betas, whose alpha_bar differs from the analytic cosine
+    by up to 5e-4. A surrogate that guides that Architect should see the same
+    states, so time t in [0, 1] is snapped to the integer grid t*999.
+    """
+
+    def __init__(self, s: float = 0.008, steps: int = 1000) -> None:
+        from diffusers import DDPMScheduler
+
+        self.s = float(s)
+        self.steps = int(steps)
+        scheduler = DDPMScheduler(num_train_timesteps=self.steps, beta_schedule="squaredcos_cap_v2")
+        self.alphas_cumprod = scheduler.alphas_cumprod.double()
+
+    def snap(self, t: torch.Tensor) -> torch.Tensor:
+        """Round t in [0, 1] to the nearest integer timestep, still expressed in [0, 1]."""
+        return torch.round(t * TIME_SCALE).clamp(0, self.steps - 1) / TIME_SCALE
+
+    def alpha_sigma(self, t: torch.Tensor | float) -> tuple[torch.Tensor, torch.Tensor]:
+        value = torch.as_tensor(t)
+        index = torch.round(value * TIME_SCALE).long().clamp(0, self.steps - 1)
+        bar = self.alphas_cumprod.to(index.device)[index].to(value.dtype if value.is_floating_point()
+                                                             else torch.float32)
+        return bar.sqrt(), (1.0 - bar).clamp_min(0.0).sqrt()
+
+
 def vp_model_time(t: torch.Tensor | float, batch_size: int, device: torch.device) -> torch.Tensor:
     value = torch.as_tensor(t, dtype=torch.float32, device=device)
     if value.ndim == 0:
@@ -34,12 +63,25 @@ def vp_model_time(t: torch.Tensor | float, batch_size: int, device: torch.device
     return value * TIME_SCALE
 
 
-def sample_vp_path(clean: torch.Tensor, schedule: CosineVPSchedule) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return x_t = alpha*x0 + sigma*noise and v = alpha*noise - sigma*x0."""
+def sample_vp_path(
+    clean: torch.Tensor,
+    schedule: CosineVPSchedule | DiscreteCosineSchedule,
+    time_power: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return x_t = alpha*x0 + sigma*noise and v = alpha*noise - sigma*x0.
+
+    Times are stratified over the batch. `time_power` > 1 maps u -> u**power,
+    which concentrates training on nearly clean states (power 2 puts 45% of the
+    samples at t <= 0.2 instead of 20%) while still covering the noisy end.
+    """
     batch_size = clean.shape[0]
     time = (torch.arange(batch_size, device=clean.device, dtype=clean.dtype)
             + torch.rand(batch_size, device=clean.device, dtype=clean.dtype)) / batch_size
     time = time[torch.randperm(batch_size, device=clean.device)]
+    if time_power != 1.0:
+        time = time.pow(time_power)
+    if isinstance(schedule, DiscreteCosineSchedule):
+        time = schedule.snap(time)
     alpha, sigma = schedule.alpha_sigma(time)
     shape = (-1, *([1] * (clean.ndim - 1)))
     alpha, sigma = alpha.reshape(shape), sigma.reshape(shape)

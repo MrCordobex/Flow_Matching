@@ -18,7 +18,7 @@ from tfm_shells.config import load_config, resolve_project_path
 from tfm_shells.data.conditioning import split_records_balanced_validation
 from tfm_shells.data.dataset import ShellDataset, compute_normalization_stats
 from tfm_shells.data.index import build_dataset_index, dataset_summary, filter_records, split_records
-from tfm_shells.vp_diffusion import CosineVPSchedule, sample_vp_path, vp_model_time
+from tfm_shells.vp_diffusion import CosineVPSchedule, DiscreteCosineSchedule, sample_vp_path, vp_model_time
 from tfm_shells.models.factory import build_unet, count_parameters
 from tfm_shells.training.common import (
     expand_physics_stats,
@@ -79,10 +79,35 @@ def _nested_epoch_lambda(
     )
 
 
+def _time_power(config: dict[str, Any]) -> float:
+    """training.timestep_sampling: {kind: uniform} (default) or {kind: power, exponent: p}."""
+    sampling = config["training"].get("timestep_sampling", {"kind": "uniform"})
+    kind = str(sampling.get("kind", "uniform"))
+    if kind == "uniform":
+        return 1.0
+    if kind == "power":
+        exponent = float(sampling["exponent"])
+        if exponent <= 0:
+            raise ValueError("timestep_sampling.exponent must be positive")
+        return exponent
+    raise ValueError("timestep_sampling.kind must be 'uniform' or 'power'")
+
+
+def _build_schedule(config: dict[str, Any]) -> CosineVPSchedule | DiscreteCosineSchedule:
+    """model.schedule: continuous (default, analytic cosine) or discrete (the Architect's integer grid)."""
+    s = float(config["model"].get("cosine_s", 0.008))
+    kind = str(config["model"].get("schedule", "continuous"))
+    if kind == "continuous":
+        return CosineVPSchedule(s)
+    if kind == "discrete":
+        return DiscreteCosineSchedule(s)
+    raise ValueError("model.schedule must be 'continuous' or 'discrete'")
+
+
 def _run_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
-    schedule: CosineVPSchedule,
+    schedule: CosineVPSchedule | DiscreteCosineSchedule,
     optimizer: torch.optim.Optimizer | None,
     stats: dict[str, Any],
     config: dict[str, Any],
@@ -118,6 +143,9 @@ def _run_epoch(
     total_items = 0
 
     power = float(config["training"]["timestep_power"])
+    # Validation always samples t uniformly, so the best checkpoint is chosen by
+    # the same criterion whatever training distribution a config asks for.
+    time_power = _time_power(config) if is_train else 1.0
     weak_form_cfg = config["training"].get("weak_form", {})
     active_refinement_cfg = config["training"].get("active_refinement", {})
     use_uncertainty_weighting = bool(config["training"].get("uncertainty_weighting", False))
@@ -143,7 +171,7 @@ def _run_epoch(
 
             p_mean, p_std = expand_physics_stats(stats, batch_size, device)
 
-            z_noisy, time, _ = sample_vp_path(z_clean, schedule)
+            z_noisy, time, _ = sample_vp_path(z_clean, schedule, time_power)
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -367,7 +395,7 @@ def train_engineer(
     config = load_config(config_path)
     if config["model"].get("method") != "vp_conditioned_surrogate":
         raise ValueError("Engineer model.method must be vp_conditioned_surrogate")
-    vp_schedule = CosineVPSchedule(float(config["model"].get("cosine_s", 0.008)))
+    vp_schedule = _build_schedule(config)
     seed_everything(int(config["seed"]))
     directories = prepare_run_directories(config, role=role)
     device = resolve_device(str(config["runtime"]["device"]))
@@ -483,6 +511,8 @@ def train_engineer(
             f"active_refinement={bool(config['training'].get('active_refinement', {}).get('enabled', False))} "
             f"uncertainty_weighting={bool(config['training'].get('uncertainty_weighting', False))}"
         )
+        print(f"schedule={config['model'].get('schedule', 'continuous')} "
+              f"train_timestep_power={_time_power(config)} (validation: uniform)")
         print(f"model_parameters: {model_parameters:,}")
         print(f"artifacts: {directories['run_root']}")
         print(f"checkpoints: {directories['model_root']}")
@@ -583,7 +613,9 @@ def train_engineer(
                 "optimizer_state_dict": optimizer.state_dict(),
                 "model_config": config["model"],
                 "diffusion_config": {"method": "cosine_vp_conditioned", "cosine_s": vp_schedule.s,
-                                     "time_scale": 999.0, "architect_method": "cosine_vp_v"},
+                                     "time_scale": 999.0, "architect_method": "cosine_vp_v",
+                                     "schedule": str(config["model"].get("schedule", "continuous")),
+                                     "timestep_power": _time_power(config)},
                 "normalization_stats": stats,
                 "config_path": str(config["_meta"]["config_path"]),
                 "dataset_summary": splits["dataset_summary"],
