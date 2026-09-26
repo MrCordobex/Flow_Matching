@@ -49,7 +49,7 @@ training:
   # Validation always uses uniform t, so checkpoints are selected by the same criterion.
   timestep_sampling:
     kind: power
-    exponent: 2.0
+    exponent: 3.0
   constitutive:
     enabled: true
     young_modulus: 3.0e10
