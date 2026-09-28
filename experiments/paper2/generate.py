@@ -41,6 +41,7 @@ OPTIONAL_SURROGATES = {
     "hybrid": "engineer_hybrid.pt",        # original hybrid: continuous schedule, uniform t
     "hybrid_u2": "engineer_hybrid_u2.pt",  # discrete schedule, t = u^2 (PREREGISTRO, amendment 1)
     "hybrid_u3": "engineer_hybrid_u3.pt",  # discrete schedule, t = u^3 (amendment 2)
+    "hybrid_wavelet": "engineer_hybrid_wavelet.pt",  # hybrid_u3 + noise-aware wavelet split
 }
 SNAPSHOTS = 20  # full correction fields kept per sample, spread over the guided steps
 

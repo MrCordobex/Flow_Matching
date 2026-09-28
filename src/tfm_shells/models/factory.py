@@ -9,10 +9,26 @@ from tfm_shells.models.equino import EquiNOModel
 from tfm_shells.models.hybrid_fourier_unet import HybridFourierUNet
 from tfm_shells.models.parallel_pb_unet import ParallelPBUNet
 from tfm_shells.models.shell_weakrefine_operator import ShellWeakRefineOperator
+from tfm_shells.models.wavelet import WaveletSplitSurrogate
 
 
 def build_unet(model_config: dict[str, Any]) -> torch.nn.Module:
     kind = str(model_config.get("kind", "unet"))
+    if kind == "wavelet_split":
+        # The wrapper takes the usual [x_t, fz]; the backbone gets [shell, noise, fz].
+        backbone_kind = str(model_config["backbone"])
+        if backbone_kind == "wavelet_split":
+            raise ValueError("wavelet_split needs a surrogate backbone, not another wavelet_split")
+        wavelet = model_config.get("wavelet", {})
+        backbone = build_unet(dict(model_config, kind=backbone_kind,
+                                   in_channels=int(model_config["in_channels"]) + 1))
+        return WaveletSplitSurrogate(
+            backbone,
+            sample_size=int(model_config["sample_size"]),
+            levels=int(wavelet.get("levels", 4)),
+            threshold=float(wavelet.get("threshold", 3.0)),
+            learnable_threshold=bool(wavelet.get("learnable_threshold", True)),
+        )
     if kind == "hybrid_fourier_unet":
         return HybridFourierUNet(
             sample_size=int(model_config["sample_size"]),

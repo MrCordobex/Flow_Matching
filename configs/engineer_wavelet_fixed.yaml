@@ -1,0 +1,75 @@
+# Ablation for engineer_wavelet.yaml: k fixed at 3 in every band instead of learnt.
+seed: 42
+
+data:
+  dataset_dir: ../Datos/processed_image2/processed_image2
+  subset: solid
+  min_mf_mean: null
+  val_ratio: 0.20
+  batch_size: 8
+  num_workers: 0
+  pin_memory: true
+  include_fz_channel: true
+
+model:
+  kind: wavelet_split
+  backbone: hybrid_fourier_unet   # or parallel_pb_unet (then add its UNet keys)
+  wavelet:
+    levels: 4                     # detail bands of 1, 2, 4, 8 px; needs 2**(levels+1) < sample_size
+    threshold: 3.0                # k: a coefficient counts as shell when it clearly exceeds k * noise std
+    learnable_threshold: false
+  sample_size: 64
+  in_channels: 2                  # [x_t, fz] as always; the backbone gets 3 internally
+  out_channels: 13
+  branch_channels:
+    u: 1
+    m: 6
+    f: 6
+  base_channels: 32
+  spectral_modes: 8
+  spectral_layers: 2
+  fft_padding: 4
+  time_embedding_dim: 128
+  dropout: 0.05
+  method: vp_conditioned_surrogate
+  cosine_s: 0.008
+  schedule: discrete
+
+training:
+  epochs: 60
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+  lr_patience: 5
+  lr_factor: 0.5
+  early_stopping_patience: 15
+  mixed_precision: false
+  lambda_max: 1.0e-3
+  warmup_epochs: 5
+  timestep_power: 2.0          # weight of the virtual-work term, (1 - t)^p
+  timestep_sampling:
+    kind: power
+    exponent: 3.0
+  constitutive:
+    enabled: true
+    young_modulus: 3.0e10
+    poisson_ratio: 0.2
+    thickness: 0.1
+    lambda_max: 0.05
+    warmup_epochs: 5
+  gradient:
+    enabled: true
+    lambda_max: 0.05
+    warmup_epochs: 5
+
+mlflow:
+  tracking_uri: ./mlruns
+  experiment_name: engineer_vp_fourier_unet_solid
+  run_name_prefix: engineer_hybrid_wavelet_fixed
+  tags:
+    model_role: engineer
+    stage: thesis
+
+runtime:
+  device: auto
+  project_name: tfm_shells
