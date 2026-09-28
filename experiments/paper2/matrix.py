@@ -30,7 +30,7 @@ class Run:
     grad_clip: float = 5.0
     bell_peak: float = 0.5
     bell_width: float = 0.22
-    engineer: str = "pbunet"     # pbunet | hybrid
+    engineer: str = "pbunet"     # pbunet | hybrid | hybrid_u2 | hybrid_u3
     guide_every: int = 1         # evaluate the surrogate every n-th step
     tag: str = ""
     seed: int = DEFAULT_SEED     # a new pool only for the confirmation block
@@ -150,6 +150,15 @@ def block6_anchor() -> Iterator[Run]:
         yield Run(block="b6a", provider=provider, steps=FULL_STEPS, eta=1.0, guidance_scale=10.0)
 
 
+def block7_retrained_hybrids() -> Iterator[Run]:
+    """Phase 4: the hybrids retrained on low-noise-heavy timesteps, on the b6 grid plus gamma 250."""
+    for engineer in ("hybrid_u2", "hybrid_u3"):
+        for scale in B6_GAMMAS + (PAPER_SCALE,):
+            for steps in B6_STEPS:
+                yield Run(block="b7", provider="noise_aware", engineer=engineer, steps=steps,
+                          eta=1.0, guidance_scale=scale)
+
+
 BLOCKS = {
     "b1": block1_frontier,
     "b2": block2_stochasticity,
@@ -160,6 +169,7 @@ BLOCKS = {
     "b6r": block6_reference,
     "b6u": block6_twins,
     "b6a": block6_anchor,
+    "b7": block7_retrained_hybrids,
 }
 
 

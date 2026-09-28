@@ -34,6 +34,14 @@ from paper2.models import (
 from paper2.providers import GuidanceCost, bell_weight, make_provider
 
 SEED = matrix.DEFAULT_SEED
+# Surrogates loaded when their file is in --models-dir. The key is Run.engineer
+# (or "clean" for the Tweedie baseline), so each file maps to its own run_ids.
+OPTIONAL_SURROGATES = {
+    "clean": "clean_solid.pt",
+    "hybrid": "engineer_hybrid.pt",        # original hybrid: continuous schedule, uniform t
+    "hybrid_u2": "engineer_hybrid_u2.pt",  # discrete schedule, t = u^2 (PREREGISTRO, amendment 1)
+    "hybrid_u3": "engineer_hybrid_u3.pt",  # discrete schedule, t = u^3 (amendment 2)
+}
 SNAPSHOTS = 20  # full correction fields kept per sample, spread over the guided steps
 
 
@@ -126,7 +134,7 @@ def run_one(
     batch_size: int,
     device: torch.device,
 ) -> tuple[np.ndarray, dict]:
-    engineer = surrogates.get("pbunet" if run.engineer == "pbunet" else "hybrid")
+    engineer = surrogates.get(run.engineer)
     clean = surrogates.get("clean")
     cost = GuidanceCost()
     guided = run.guidance_scale > 0.0
@@ -214,7 +222,7 @@ def main() -> None:
 
     architect, schedule, architect_stats = load_architect(architect_path, device)
     surrogates = {"pbunet": load_surrogate("pbunet", engineer_path, device)}
-    for key, filename in (("clean", "clean_solid.pt"), ("hybrid", "engineer_hybrid.pt")):
+    for key, filename in OPTIONAL_SURROGATES.items():
         candidate = args.models_dir / filename
         if candidate.exists():
             surrogates[key] = load_surrogate(key, candidate, device)

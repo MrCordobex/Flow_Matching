@@ -36,8 +36,8 @@ def load_fem(results: Path, entry: dict) -> np.ndarray:
 def evaluator(entry: dict) -> str:
     if entry["guidance_scale"] == 0.0:
         return "unguided"
-    if entry["engineer"] == "hybrid":
-        return "HY"
+    if entry["engineer"].startswith("hybrid"):  # hybrid -> HY, hybrid_u3 -> HY-u3
+        return "HY" + entry["engineer"][len("hybrid"):].replace("_", "-")
     return {"noise_aware": "NA", "tweedie_clean": "TC", "tweedie_self": "TS",
             "naive_clean": "NC"}[entry["provider"]]
 
