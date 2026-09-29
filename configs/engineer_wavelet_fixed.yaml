@@ -49,7 +49,7 @@ training:
   timestep_power: 2.0          # weight of the virtual-work term, (1 - t)^p
   timestep_sampling:
     kind: power
-    exponent: 3.0
+    exponent: 1.0
   constitutive:
     enabled: true
     young_modulus: 3.0e10
