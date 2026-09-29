@@ -53,10 +53,13 @@ EVALUATORS = {
     "hybrid_tweedie": ("hybrid", "estimate", "zero"),
     "hybrid_u3": ("hybrid_u3", "state", "t"),
     "hybrid_wavelet": ("hybrid_wavelet", "state", "t"),
+    "hybrid_bands": ("hybrid_bands", "state", "t"),
+    "hybrid_bands_noev": ("hybrid_bands_noev", "state", "t"),
 }
 # Missing files are skipped, so the new evaluators cost nothing until their checkpoint exists.
 CHECKPOINTS = {"pbunet": "engineer_solid.pt", "clean": "clean_solid.pt", "hybrid": "engineer_hybrid.pt",
-               "hybrid_u3": "engineer_hybrid_u3.pt", "hybrid_wavelet": "engineer_hybrid_wavelet.pt"}
+               "hybrid_u3": "engineer_hybrid_u3.pt", "hybrid_wavelet": "engineer_hybrid_wavelet.pt",
+               "hybrid_bands": "engineer_hybrid_bands.pt", "hybrid_bands_noev": "engineer_hybrid_bands_noev.pt"}
 BRANCHES = {"u": slice(0, 1), "m": slice(1, 7), "f": slice(7, 13)}
 
 
