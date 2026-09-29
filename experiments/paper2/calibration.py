@@ -36,7 +36,7 @@ from tfm_shells.constants import PHYSICS_KEYS
 from tfm_shells.utils.physics import compute_membrane_factor_map_from_real_physics
 
 from paper2.discrete_vp import split_velocity
-from paper2.models import architect_to_surrogate, load_architect, load_surrogate
+from paper2.models import architect_to_surrogate, load_architect, load_surrogate, warn_if_noise_rescaled
 
 # Split of every published checkpoint (their dataset_summary: 1920 train / 480 val).
 SPLIT_SEED, VAL_RATIO = 42, 0.20
@@ -55,11 +55,13 @@ EVALUATORS = {
     "hybrid_wavelet": ("hybrid_wavelet", "state", "t"),
     "hybrid_bands": ("hybrid_bands", "state", "t"),
     "hybrid_bands_noev": ("hybrid_bands_noev", "state", "t"),
+    "hybrid_ncf": ("hybrid_ncf", "state", "t"),
 }
 # Missing files are skipped, so the new evaluators cost nothing until their checkpoint exists.
 CHECKPOINTS = {"pbunet": "engineer_solid.pt", "clean": "clean_solid.pt", "hybrid": "engineer_hybrid.pt",
                "hybrid_u3": "engineer_hybrid_u3.pt", "hybrid_wavelet": "engineer_hybrid_wavelet.pt",
-               "hybrid_bands": "engineer_hybrid_bands.pt", "hybrid_bands_noev": "engineer_hybrid_bands_noev.pt"}
+               "hybrid_bands": "engineer_hybrid_bands.pt", "hybrid_bands_noev": "engineer_hybrid_bands_noev.pt",
+               "hybrid_ncf": "engineer_hybrid_ncf.pt"}
 BRANCHES = {"u": slice(0, 1), "m": slice(1, 7), "f": slice(7, 13)}
 
 
@@ -174,6 +176,7 @@ def main() -> None:
             print(f"skip {key}: {path} missing", flush=True)
             continue
         surrogate = load_surrogate(key, path, device)
+        warn_if_noise_rescaled(architect_stats, surrogate)
         load_field = 2.0 * (fz - float(surrogate.stats["fz_min"])) / (
             float(surrogate.stats["fz_max"]) - float(surrogate.stats["fz_min"]) + 1e-8) - 1.0
         target = ((physics - surrogate.physics_mean.cpu().view(1, -1, 1, 1))

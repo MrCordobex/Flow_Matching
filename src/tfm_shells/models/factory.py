@@ -7,6 +7,7 @@ from diffusers import UNet2DModel
 
 from tfm_shells.models.equino import EquiNOModel
 from tfm_shells.models.hybrid_fourier_unet import HybridFourierUNet
+from tfm_shells.models.ncf_hybrid import NoiseCalibratedHybrid
 from tfm_shells.models.parallel_pb_unet import ParallelPBUNet
 from tfm_shells.models.shell_weakrefine_operator import ShellWeakRefineOperator
 from tfm_shells.models.wavelet import WaveletSplitSurrogate, extra_channels
@@ -35,6 +36,26 @@ def build_unet(model_config: dict[str, Any]) -> torch.nn.Module:
             learnable_threshold=bool(wavelet.get("learnable_threshold", True)),
             mode=mode,
             evidence=evidence,
+        )
+    if kind == "ncf_hybrid":
+        ncf = model_config.get("ncf", {})
+        return NoiseCalibratedHybrid(
+            sample_size=int(model_config["sample_size"]),
+            in_channels=int(model_config["in_channels"]),
+            out_channels=int(model_config["out_channels"]),
+            base_channels=int(model_config.get("base_channels", 32)),
+            spectral_modes=int(model_config.get("spectral_modes", 8)),
+            spectral_layers=int(model_config.get("spectral_layers", 2)),
+            fft_padding=int(model_config.get("fft_padding", 4)),
+            time_embedding_dim=int(model_config.get("time_embedding_dim", 128)),
+            dropout=float(model_config.get("dropout", 0.05)),
+            branch_channels=model_config.get("branch_channels"),
+            noise_condition=bool(ncf.get("noise_condition", True)),
+            calibrated_stem=bool(ncf.get("calibrated_stem", True)),
+            filter_scales=tuple(float(s) for s in ncf.get("filter_scales", (1.0, 2.0, 4.0))),
+            conditional_filters=bool(ncf.get("conditional_filters", True)),
+            attention=bool(ncf.get("attention", True)),
+            attention_heads=int(ncf.get("attention_heads", 4)),
         )
     if kind == "hybrid_fourier_unet":
         return HybridFourierUNet(

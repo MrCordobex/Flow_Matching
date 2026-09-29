@@ -30,6 +30,7 @@ from paper2.models import (
     load_architect,
     load_surrogate,
     normalize_load,
+    warn_if_noise_rescaled,
 )
 from paper2.providers import GuidanceCost, bell_weight, make_provider
 
@@ -43,6 +44,7 @@ OPTIONAL_SURROGATES = {
     "hybrid_u3": "engineer_hybrid_u3.pt",  # discrete schedule, t = u^3 (amendment 2)
     "hybrid_wavelet": "engineer_hybrid_wavelet.pt",  # hybrid_u3 + noise-aware wavelet split
     "hybrid_bands": "engineer_hybrid_bands.pt",      # hybrid_u3 + wavelet bands and confidence maps
+    "hybrid_ncf": "engineer_hybrid_ncf.pt",          # noise-calibrated conditional-filter hybrid
 }
 SNAPSHOTS = 20  # full correction fields kept per sample, spread over the guided steps
 
@@ -229,6 +231,8 @@ def main() -> None:
         if candidate.exists():
             surrogates[key] = load_surrogate(key, candidate, device)
             print(f"loaded optional surrogate {key} from {candidate.name}", flush=True)
+    for surrogate in surrogates.values():
+        warn_if_noise_rescaled(architect_stats, surrogate)
 
     needed = {r.engineer for r in runs} | {
         "clean" for r in runs if r.provider in ("tweedie_clean", "naive_clean")

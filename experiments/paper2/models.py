@@ -95,6 +95,18 @@ def architect_to_surrogate(
     return 2.0 * (metres - s_low) / (s_high - s_low + 1e-8) - 1.0
 
 
+def warn_if_noise_rescaled(architect_stats: dict[str, Any], surrogate: Surrogate) -> None:
+    """Surrogates that read sigma_t from the scheduler (wavelet_split, ncf_hybrid)
+    assume the Architect -> surrogate height map is the identity. If it is
+    x' = a x + b, the noise they see has std |a| sigma_t instead."""
+    probe = torch.tensor([0.0, 1.0])
+    offset, one = architect_to_surrogate(probe, architect_stats, surrogate.stats).tolist()
+    scale = one - offset
+    if abs(scale - 1.0) > 1e-5 or abs(offset) > 1e-5:
+        print(f"  WARNING: {surrogate.name}: Architect -> surrogate heights x' = {scale:.6f} x "
+              f"{offset:+.6f}; sigma_t-aware surrogates see noise std {abs(scale):.6f} sigma_t", flush=True)
+
+
 def denormalize_heights(state: torch.Tensor, architect_stats: dict[str, Any]) -> np.ndarray:
     low, high = float(architect_stats["z_min"]), float(architect_stats["z_max"])
     array = state.detach().to(torch.float32).cpu().numpy()

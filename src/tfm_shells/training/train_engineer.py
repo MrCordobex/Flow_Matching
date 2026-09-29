@@ -457,7 +457,7 @@ def train_engineer(
     surrogate_kind = config["model"].get("kind")
     if surrogate_kind == "wavelet_split":
         surrogate_kind = config["model"].get("backbone")
-    if (surrogate_kind not in {"parallel_pb_unet", "hybrid_fourier_unet"}
+    if (surrogate_kind not in {"parallel_pb_unet", "hybrid_fourier_unet", "ncf_hybrid"}
             or not bool(config["data"]["include_fz_channel"])
             or int(config["model"]["out_channels"]) != 13):
         raise ValueError("VP Engineer requires a three-branch surrogate with fz input.")

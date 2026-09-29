@@ -1,0 +1,79 @@
+# NCF-Hybrid: HY-u3 (configs/engineer_base.yaml) with the four noise-aware pieces of
+# tfm_shells/models/ncf_hybrid.py. Only model.kind, model.ncf and the mlflow names differ
+# from HY-u3. Switch pieces off in model.ncf for the ablation ladder.
+seed: 42
+
+data:
+  dataset_dir: ../Datos/processed_image2/processed_image2
+  subset: solid
+  min_mf_mean: null
+  val_ratio: 0.20
+  batch_size: 8
+  num_workers: 0
+  pin_memory: true
+  include_fz_channel: true
+
+model:
+  kind: ncf_hybrid
+  ncf:
+    noise_condition: true         # E1: alpha_t, sigma_t, log-SNR from the scheduler condition every block
+    calibrated_stem: true         # E2: Gaussian-derivative bank, responses in noise std units (z maps)
+    filter_scales: [1.0, 2.0, 4.0]  # Gaussian widths in px; 6 filters each (value, slopes, curvatures)
+    conditional_filters: true     # E3: NCF blocks (per-pixel modulation + filter mixture) replace LocalBlocks
+    attention: true               # E4: one self-attention block at the 16x16 bottleneck
+    attention_heads: 4
+  sample_size: 64
+  in_channels: 2                  # [x_t, fz] as always
+  out_channels: 13
+  branch_channels:
+    u: 1
+    m: 6
+    f: 6
+  base_channels: 32
+  spectral_modes: 8
+  spectral_layers: 2
+  fft_padding: 4
+  time_embedding_dim: 128
+  dropout: 0.05
+  method: vp_conditioned_surrogate
+  cosine_s: 0.008
+  schedule: discrete
+
+training:
+  epochs: 60
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+  lr_patience: 5
+  lr_factor: 0.5
+  early_stopping_patience: 15
+  mixed_precision: false
+  lambda_max: 1.0e-3
+  warmup_epochs: 5
+  timestep_power: 2.0          # weight of the virtual-work term, (1 - t)^p
+  timestep_sampling:
+    kind: power
+    exponent: 3.0
+  constitutive:
+    enabled: true
+    young_modulus: 3.0e10
+    poisson_ratio: 0.2
+    thickness: 0.1
+    lambda_max: 0.05
+    warmup_epochs: 5
+  gradient:
+    enabled: true
+    lambda_max: 0.05
+    warmup_epochs: 5
+
+mlflow:
+  tracking_uri: ./mlruns
+  experiment_name: engineer_vp_fourier_unet_solid
+  run_name_prefix: engineer_hybrid_ncf
+  tags:
+    model_role: engineer
+    stage: thesis
+
+runtime:
+  device: auto
+  project_name: tfm_shells
