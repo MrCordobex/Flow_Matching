@@ -57,6 +57,7 @@ class Variant:
     probe: tuple | None = PROBE_GRID
     native: tuple = ()           # strengths when there is no probe
     needs: tuple = ("clean",)    # surrogates the variant cannot run without
+    max_batch: int | None = None  # memory cap per chunk, for methods that multiply the batch with a graph
 
 
 VARIANTS = (
@@ -67,7 +68,9 @@ VARIANTS = (
     Variant("tc_detached", "tc_detached"),
     Variant("dps", "dps"),
     Variant("mpgd", "mpgd"),
-    Variant("lgd", "lgd"),
+    # 4 Monte Carlo copies per sample go through the 361 M clean PB-PUNet with a
+    # graph kept for the gradient: 25 x 4 does not fit in 40 GB, 8 x 4 does.
+    Variant("lgd", "lgd", max_batch=8),
     # The guidance rate lives in [0, 1] and already moves the predicted MF from
     # 0.49 to 0.71 at 0.02, so the grid reaches down to 1e-3 to resolve the
     # weak-guidance, high-diversity end of the curve.
@@ -151,6 +154,7 @@ def generate_batch(ctx: Context, run: LitRun, noise: torch.Tensor, batch_size: i
     cost = Cost()
     chunks = []
     started = time.perf_counter()
+    batch_size = min(batch_size, variant.max_batch or batch_size)
     for begin in range(0, noise.shape[0], batch_size):
         generator = torch.Generator(device=device).manual_seed(run.seed + begin)
         states = method(ctx, noise[begin:begin + batch_size], run.steps, generator, cost,
@@ -159,6 +163,8 @@ def generate_batch(ctx: Context, run: LitRun, noise: torch.Tensor, batch_size: i
     if device.type == "cuda":
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - started
+    if device.type == "cuda":
+        torch.cuda.empty_cache()  # outside the timing: particle and MC methods leave large, odd-sized blocks
     return torch.cat(chunks), cost, elapsed
 
 
