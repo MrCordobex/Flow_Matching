@@ -68,7 +68,10 @@ VARIANTS = (
     Variant("dps", "dps"),
     Variant("mpgd", "mpgd"),
     Variant("lgd", "lgd"),
-    Variant("dsg", "dsg", probe=(0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0)),
+    # The guidance rate lives in [0, 1] and already moves the predicted MF from
+    # 0.49 to 0.71 at 0.02, so the grid reaches down to 1e-3 to resolve the
+    # weak-guidance, high-diversity end of the curve.
+    Variant("dsg", "dsg", probe=(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0)),
     Variant("freedom", "freedom"),
     Variant("ugd", "ugd"),
     Variant("tfg", "tfg"),
